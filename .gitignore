@@ -1,0 +1,74 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Large Data Files (Git ignored - store separately)
+*.pkl
+*.pickle
+*.npy
+*.npz
+*.parquet
+*.h5
+*.hdf5
+
+# Media files
+*.mp4
+*.avi
+*.mov
+*.wmv
+
+# Output files
+outputs/
+results/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Environment
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Configs with secrets
+configs/secrets.yaml
+configs/local_config.yaml
