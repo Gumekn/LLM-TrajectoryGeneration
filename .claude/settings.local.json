@@ -3,7 +3,8 @@
     "allow": [
       "Bash(git add:*)",
       "Bash(ls:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Skill(claude-hud:configure)"
     ]
   }
 }
