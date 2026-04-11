@@ -161,11 +161,15 @@ class KnowledgeBaseRecord:
     # 标签与评估
     label: LabelStatus
     danger_type: DangerType
+    danger_level: str = "low"  # high/medium/low
     evaluated_by: EvaluatedBy
     confidence: float
 
     # 评估理由
     evaluation_reasoning: str = ""
+
+    # 生成参数上下文（用于可解释性）
+    creation_context: str = ""  # JSON格式存储生成参数
 
     # 相似案例引用
     similar_cases: List[str] = field(default_factory=list)
@@ -346,9 +350,11 @@ class SQLiteManager(DatabaseManager):
                 embedding BLOB,         -- 序列化的向量
                 label TEXT NOT NULL,
                 danger_type TEXT,
+                danger_level TEXT DEFAULT 'low',
                 evaluated_by TEXT,
                 confidence REAL,
                 evaluation_reasoning TEXT,
+                creation_context TEXT,   -- JSON格式存储生成参数
                 similar_cases TEXT,     -- JSON格式存储相似案例ID列表
                 query_count INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -522,19 +528,21 @@ class SQLiteManager(DatabaseManager):
         try:
             self.cursor.execute("""
                 INSERT OR REPLACE INTO knowledge_base
-                (case_id, trajectory_id, embedding, label, danger_type,
-                 evaluated_by, confidence, evaluation_reasoning, similar_cases,
+                (case_id, trajectory_id, embedding, label, danger_type, danger_level,
+                 evaluated_by, confidence, evaluation_reasoning, creation_context, similar_cases,
                  query_count, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 record.case_id,
                 record.trajectory_id,
                 pickle.dumps(record.embedding),
                 record.label.value,
                 record.danger_type.value,
+                record.danger_level,
                 record.evaluated_by.value,
                 record.confidence,
                 record.evaluation_reasoning,
+                record.creation_context,
                 json.dumps(record.similar_cases),
                 record.query_count,
                 record.created_at,
@@ -597,9 +605,11 @@ class SQLiteManager(DatabaseManager):
             embedding=pickle.loads(row['embedding']),
             label=LabelStatus(row['label']),
             danger_type=DangerType(row['danger_type']),
+            danger_level=row.get('danger_level', 'low'),
             evaluated_by=EvaluatedBy(row['evaluated_by']),
             confidence=row['confidence'],
             evaluation_reasoning=row['evaluation_reasoning'],
+            creation_context=row.get('creation_context', ''),
             similar_cases=json.loads(row['similar_cases']) if row['similar_cases'] else [],
             query_count=row['query_count'],
             created_at=datetime.fromisoformat(row['created_at']),

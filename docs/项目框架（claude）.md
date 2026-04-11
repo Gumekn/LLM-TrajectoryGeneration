@@ -56,36 +56,225 @@ Waymo原始数据
 [Step 9] CARLA格式导出与闭环测试
 ```
 
-### 2.2 穷举生成模块设计
+#### 2.2.1 Waymo原始数据格式说明
 
-#### 2.2.1 变异参数定义
+本系统处理的原始数据来自Waymo开放数据集，存储格式为`.pkl`（Python pickle）文件。每个场景文件包含一个场景的完整时序数据。
 
-| 参数名             | 物理意义       | 取值范围        | 步长 | 说明           |
-| ------------------ | -------------- | --------------- | ---- | -------------- |
-| `accel_offset`   | 纵向加速度偏移 | [-4, 4] m/s²   | 0.5  | 模拟加减速变化 |
-| `speed_scale`    | 速度缩放因子   | [0.7, 1.5]      | 0.1  | 模拟速度变化   |
-| `lateral_offset` | 横向位置偏移   | [-2, 2] m       | 0.3  | 模拟换道/切入  |
-| `time_shift`     | 时间轴偏移     | [-1, 1] s       | 0.2  | 模拟时机变化   |
-| `heading_bias`   | 航向角偏移     | [-0.3, 0.3] rad | 0.1  | 模拟角度变化   |
-
-#### 2.2.2 穷举策略
+**数据结构定义**：
 
 ```python
-# 参数组合数计算
-params = {
-    'accel_offset': range(-4, 4.5, 0.5),      # 17个值
-    'speed_scale': range(0.7, 1.5, 0.1),       # 9个值
-    'lateral_offset': range(-2, 2.1, 0.3),     # 14个值
-    'time_shift': range(-1, 1.1, 0.2),         # 11个值
+{
+    'object_tracks': {
+        [object_id]: {
+            'type': 'VEHICLE' | 'PEDESTRIAN' | 'CYCLIST' | ...,  # 物体类型
+            'state': {
+                'action': np.ndarray,                    # 动作数据
+                'global_center': np.ndarray (N, 3),     # 全局位置 [x, y, z] 单位:m
+                'heading': np.ndarray (N,),                # 航向角 单位:rad
+                'local_acceleration': np.ndarray (N, 2),  # 局部加速度 [ax, ay] 单位:m/s²
+                'local_velocity': np.ndarray (N, 2),       # 局部速度 [vx, vy] 单位:m/s
+                'size': np.ndarray (N, 3),               # 物体尺寸 [length, width, height] 单位:m
+                'valid': np.ndarray (N,) bool           # 有效标记
+            }
+        }
+    },
+    'map_features': {},        # 静态地图数据（车道线、交通标志等）
+    'dynamic_map_states': {},   # 动态地图状态（交通灯等）
+    'extra_information': {
+        'sdc_id': str,          # 自车（Self-Driving Car）ID
+        'scene_length': int,    # 场景总帧数
+        'timestamp': np.ndarray # 时间戳序列
+    }
 }
-
-# 全组合：17 × 9 × 14 × 11 = 23,562 种
-# 实际采用智能采样：约 1000-5000 条
 ```
 
-#### 2.2.3 智能采样策略
+**关键变量说明**：
 
-| 策略         | 说明                     | 适用场景       |
+| 变量名 | 数据类型 | 形状 | 单位 | 物理意义 |
+|--------|----------|------|------|----------|
+| `global_center` | float | (N, 3) | m | 物体在全局坐标系下的位置 |
+| `heading` | float | (N,) | rad | 航向角（车头方向与X轴夹角） |
+| `local_velocity` | float | (N, 2) | m/s | 物体在自身坐标系下的速度 [纵向, 横向] |
+| `local_acceleration` | float | (N, 2) | m/s² | 物体在自身坐标系下的加速度 [纵向, 横向] |
+| `size` | float | (N, 3) | m | 物体尺寸 [长, 宽, 高] |
+| `valid` | bool | (N,) | - | 该帧数据是否有效 |
+
+**坐标系说明**：
+- Waymo使用右手坐标系（X轴向前，Y轴向左，Z轴向上）
+- `local_velocity` 和 `local_acceleration` 是在物体自身坐标系下的表示
+- 自身坐标系的X轴与物体的heading方向对齐
+
+**可用于轨迹变异的原始变量**：
+
+| 变量 | 计算衍生方式 | 变异操作 |
+|------|-------------|----------|
+| 速度 `speed` | `norm(local_velocity)` | speed_scale (缩放) |
+| 加速度 `accel` | `norm(local_acceleration)` | accel_offset (偏移) |
+| 位置 `(x, y)` | `global_center[:, 0:2]` | lateral_offset (横向偏移) |
+| 航向角 `heading` | 直接使用 | heading_bias (角度偏移) |
+| 时间 `timestamp` | 直接使用 | time_shift (时间偏移) |
+
+**场景基本信息**：
+- 采样率：10 Hz（每帧0.1秒）
+- 典型场景长度：100-200帧（10-20秒）
+- 物体类型：VEHICLE（车辆）、PEDESTRIAN（行人）、CYCLIST（骑车人）等
+
+---
+
+### 2.2.2 穷举生成模块设计（参数空间与采样策略）
+
+#### 2.2.2.1 变异参数定义
+
+| 参数名             | 物理意义       | 取值范围        | 步长 | 说明           | 变异公式 |
+| ------------------ | -------------- | --------------- | ---- | -------------- | -------- |
+| `accel_offset`   | 纵向加速度偏移 | [-4, 4] m/s²   | 0.5  | 模拟加减速变化 | `accel_new = accel_base + offset` |
+| `speed_scale`    | 速度缩放因子   | [0.7, 1.5]      | 0.1  | 模拟速度变化   | `vel_new = vel_base × scale` |
+| `lateral_offset` | 横向位置偏移   | [-2, 2] m       | 0.3  | 模拟换道/切入  | `y_new = y_base + offset` |
+| `time_shift`     | 时间轴偏移     | [-1, 1] s       | 0.2  | 模拟时机变化   | 插值重采样 |
+| `heading_bias`   | 航向角偏移     | [-0.3, 0.3] rad | 0.1  | 模拟角度变化   | `heading_new = heading_base + bias` |
+
+#### 2.2.2.2 参数空间与采样数量计算
+
+**参数空间大小计算**：
+
+```python
+param_space = {
+    'accel_offset': np.arange(-4, 4.5, 0.5),    # 17个值: -4.0, -3.5, ..., 4.0
+    'speed_scale': np.arange(0.7, 1.6, 0.1),    # 9个值: 0.7, 0.8, ..., 1.5
+    'lateral_offset': np.arange(-2, 2.1, 0.3),  # 14个值: -2.0, -1.7, ..., 2.0
+    'time_shift': np.arange(-1, 1.1, 0.2),      # 11个值: -1.0, -0.8, ..., 1.0
+    'heading_bias': np.arange(-0.3, 0.35, 0.1), # 6个值: -0.3, -0.2, ..., 0.3
+}
+
+# 全参数空间组合数：17 × 9 × 14 × 11 × 6 = 141,372 种
+```
+
+**采样数量确定原则**：
+
+| 原则 | 说明 | 计算方式 |
+|------|------|---------|
+| 参数空间覆盖率 | 确保每个参数维度都被采样到 | `n_samples ≥ max(各参数值数量) × 采样率` |
+| 统计显著性 | 确保生成数量满足统计分析需求 | `n_samples ≥ 30`（中心极限定理） |
+| 物理可行性过滤 | 过滤后需保留足够样本 | `n_candidates = n_samples / 物理过滤率(约10%)` |
+
+**推荐采样数量计算公式**：
+
+```
+n_recommended = ceil(参数空间大小 / 降采样率)
+             = ceil(141,372 / 降采样率)
+
+降采样率选择：
+- 保守策略（降采样率=10）：约 14,000 条候选轨迹
+- 平衡策略（降采样率=20）：约 7,000 条候选轨迹  
+- 激进策略（降采样率=30）：约 4,700 条候选轨迹
+```
+
+**物理约束预过滤率估算**：
+- 基于物理规则（加速度、速度、碰撞检测）预期过滤：70-90%
+- RAG+LLM评估预期过滤：80-95%
+
+**最终期望通过数量**：
+```
+n_final = n_candidates × (1 - 物理过滤率) × (1 - LLM过滤率)
+        ≈ 7,000 × 0.2 × 0.2 ≈ 280 条
+```
+
+#### 2.2.2.3 采样策略
+
+| 策略         | 说明                     | 适用场景       | 采样比例 |
+| ------------ | ------------------------ | -------------- | -------- |
+| 网格采样     | 均匀覆盖参数空间每个维度 | 冷启动阶段     | 100%     |
+| 危险导向采样 | 优先TTC<1s等高风险区域   | 已知危险模式后 | 150%     |
+| 随机采样     | 随机选取参数组合         | 快速验证       | 50%      |
+| 分层采样     | 按危险类型分层后再采样   | 多样性要求高   | 80%      |
+| 自适应采样   | 根据评估结果动态调整密度 | 迭代优化阶段   | 可变     |
+
+**网格采样法（推荐作为基线）**：
+```python
+def grid_sampling(param_space, stride=1):
+    """
+    网格采样：每隔stride个步长取一个点
+    
+    Args:
+        param_space: 参数空间定义
+        stride: 采样间隔（1=全采样，2=隔点采样）
+    
+    Returns:
+        List[Dict]: 采样的参数组合列表
+    """
+    keys = list(param_space.keys())
+    values = [param_space[k][::stride] for k in keys]
+    
+    # 生成网格索引
+    from itertools import product
+    grid_indices = product(*[range(len(v)) for v in values])
+    
+    samples = []
+    for indices in grid_indices:
+        sample = {keys[i]: values[i][idx] for i, idx in enumerate(indices)}
+        samples.append(sample)
+    
+    return samples
+```
+
+**分层采样法（推荐用于多样性）**：
+```python
+def stratified_sampling(param_space, n_per_layer, danger_types):
+    """
+    分层采样：按危险类型分层后，每层采用网格采样
+    
+    Args:
+        param_space: 参数空间定义
+        n_per_layer: 每个危险类型层的采样数量
+        danger_types: 危险类型列表
+    
+    Returns:
+        Dict[str, List[Dict]]: {danger_type: samples}
+    """
+    samples_by_type = {}
+    
+    for d_type in danger_types:
+        # 根据危险类型调整参数空间
+        adjusted_space = adjust_param_space_by_danger(param_space, d_type)
+        # 每层采样
+        samples_by_type[d_type] = grid_sampling(adjusted_space)[:n_per_layer]
+    
+    return samples_by_type
+```
+
+**自适应采样法（推荐用于迭代优化）**：
+```python
+def adaptive_sampling(param_space, initial_n, evaluation_results, target_approved=50):
+    """
+    自适应采样：根据评估结果动态调整采样密度
+    
+    Args:
+        param_space: 参数空间定义
+        initial_n: 初始采样数量
+        evaluation_results: 评估结果列表
+        target_approved: 目标通过数量
+    
+    Returns:
+        int: 调整后的采样数量
+    """
+    # 计算当前通过率
+    approved_rate = sum(1 for r in evaluation_results if r['final_status'] == 'approved') / len(evaluation_results)
+    
+    # 预估需要的采样数量
+    if approved_rate > 0:
+        n_needed = int(target_approved / approved_rate)
+    else:
+        n_needed = initial_n * 2  # 如果通过率为0，增加采样
+    
+    # 限制最大最小值
+    return max(initial_n, min(n_needed, 50000))
+```
+
+| 策略         | 推荐采样数量 | 适用阶段 | 说明                   |
+| ------------ | ------------ | -------- | ---------------------- |
+| 网格采样     | 7,000-14,000 | 冷启动/基线 | 确保参数空间完整覆盖   |
+| 分层采样     | 每层500-1000 | 多样性场景 | 平衡各危险类型比例     |
+| 自适应采样   | 动态调整     | 迭代优化 | 根据通过率自动调整     |
 | ------------ | ------------------------ | -------------- |
 | 网格采样     | 均匀覆盖参数空间         | 冷启动阶段     |
 | 危险导向采样 | 优先采样高风险区域       | 已知危险模式后 |
@@ -473,41 +662,148 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
 
 ## 五、RAG知识库设计
 
-### 5.1 知识库结构
+### 5.1 知识库概念与数据库关系
 
-| 字段 | 类型 | 说明 |
-|-----|------|------|
-| `case_id` | string | 唯一标识 |
-| `trajectory_id` | string | 关联轨迹ID |
-| `embedding` | vector[12] | 轨迹特征向量 |
-| `label` | enum | reasonable/unreasonable |
-| `danger_type` | enum | rear_end/cut_in/head_on/side_swipe |
-| `generation_params` | dict | 生成参数（用于可解释性） |
-| `evaluated_by` | enum | human/llm_auto |
+**知识库是数据库架构的核心组成部分**，包含两层含义：
 
-### 5.2 冷启动策略
+1. **狭义知识库**：存储在ChromaDB中的轨迹特征向量 + 相关元数据，用于RAG相似度检索
+2. **广义知识库**：SQLite中 `knowledge_base` 表 + `trajectory_records` 表 + `evaluation_results` 表的联合视图
+
+**数据库架构图**：
 
 ```
-系统启动 → 知识库为空
-    ↓
-穷举生成5000条候选
-    ↓
-物理过滤 → 剩余500条
-    ↓
-人工审核50条（建立种子库）
-    ↓
-知识库初始化完成
-    ↓
-后续使用RAG辅助评估
+┌─────────────────────────────────────────────────────────────────────┐
+│                         应用层 (Python代码)                          │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐ │
+│  │ 场景处理模块 │  │ 穷举生成模块 │  │ RAG评估模块 │  │ 人工审核模块 │ │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘ │
+└─────────┼───────────────┼───────────────┼───────────────┼─────────┘
+          │               │               │               │
+          ▼               ▼               ▼               ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                    数据访问层 (DAO)                                   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                   SQLiteManager (关系型数据)                   │   │
+│  │                                                              │   │
+│  │  ┌─────────────────┐  ┌─────────────────┐                  │   │
+│  │  │ trajectory_records │  │ evaluation_results│              │   │
+│  │  │ (轨迹原始数据)    │  │ (评估结果)       │                  │   │
+│  │  └─────────────────┘  └─────────────────┘                  │   │
+│  │  ┌─────────────────┐  ┌─────────────────┐                  │   │
+│  │  │  knowledge_base  │  │  human_reviews   │                  │   │
+│  │  │  (案例元数据)    │  │  (审核记录)       │                  │   │
+│  │  └─────────────────┘  └─────────────────┘                  │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                   ChromaDBManager (向量数据库)               │   │
+│  │                                                              │   │
+│  │  ┌─────────────────────────────────────────────────────┐   │   │
+│  │  │         knowledge_base_vectors (向量集合)             │   │   │
+│  │  │  - id: case_id                                       │   │   │
+│  │  │  - embedding: 12维特征向量                             │   │   │
+│  │  │  - metadata: {label, danger_type, evaluated_by}      │   │   │
+│  │  └─────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.3 向量化编码器 (rag/embedding_encoder.py)
+### 5.2 知识库完整数据结构
 
-#### 5.3.1 功能说明
+知识库中的每个案例（Case）包含以下完整信息：
+
+| 分类 | 字段名 | 数据类型 | 说明 | 计算来源/存储方式 |
+|------|--------|----------|------|-----------------|
+| **标识** | `case_id` | string | 唯一标识 | 自动生成：`case_{timestamp}_{hash}` |
+| **关联** | `trajectory_id` | string | 关联轨迹ID | 外键关联trajectory_records |
+| **向量特征** | `embedding` | vector[12] | 12维特征向量 | TrajectoryFeatureExtractor计算，存ChromaDB |
+| **轨迹数据** | `trajectory_data` | JSON | 完整轨迹点序列 | trajectory_records存储，关联查询获取 |
+| **物理验证** | `physics_validation` | JSON | 物理指标验证结果 | PhysicsValidator输出 |
+| | - `max_long_accel` | float | 最大纵向加速度 | 计算 |
+| | - `max_lat_accel` | float | 最大横向加速度 | 计算 |
+| | - `max_speed` | float | 最大速度 | 计算 |
+| | - `collision_detected` | bool | 是否检测到碰撞 | 碰撞检测 |
+| | - `failed_rules` | list | 失败的规则ID列表 | 验证规则 |
+| **LLM评估** | `llm_evaluation` | JSON | LLM评估结果 | RAGEvaluator输出 |
+| | - `is_reasonable` | bool | 是否合理 | LLM判断 |
+| | - `confidence` | float | 置信度 | LLM返回 |
+| | - `reasoning` | string | 评估理由 | LLM生成 |
+| **标签** | `label` | enum | 合理/不合理 | reasonable/unreasonable |
+| | `danger_type` | enum | 危险类型 | rear_end/cut_in/head_on/side_swipe |
+| | `danger_level` | enum | 危险等级 | high/medium/low |
+| **元数据** | `evaluated_by` | enum | 评估来源 | human/llm_auto |
+| | `confidence` | float | 置信度 | LLM返回 |
+| | `creation_context` | JSON | 生成参数 | 记录accel_offset等参数 |
+| **统计** | `similar_cases` | list | 入库时检索到的相似案例 | RAG检索结果 |
+| | `query_count` | int | 被查询次数 | 统计 |
+
+**数据库存储位置**：
+
+| 数据类型 | 存储位置 | 存储格式 |
+|---------|---------|---------|
+| 12维特征向量 | ChromaDB | float32[12] |
+| 轨迹原始数据 | SQLite trajectory_records | BLOB (pickle) |
+| 物理验证结果 | SQLite evaluation_results | JSON |
+| LLM评估结果 | SQLite evaluation_results | JSON |
+| 案例元数据 | SQLite knowledge_base | 各字段 |
+| 标签信息 | SQLite knowledge_base + ChromaDB metadata | enum + string |
+
+### 5.3 知识库构建完整流程
+
+知识库的构建发生在每条轨迹通过评估之后：
+
+```
+候选轨迹生成
+    │
+    ▼
+[Step 1] 物理验证 (PhysicsValidator)
+    │ 计算物理指标：max_accel, max_speed, jerk, collision
+    │ 输出：ValidationResult
+    ▼
+[Step 2] 特征提取 (TrajectoryFeatureExtractor)
+    │ 提取12维特征向量
+    │ 输出：embedding[12]
+    ▼
+[Step 3] RAG检索 (RAGEvaluator.query_similar_cases)
+    │ ChromaDB相似度检索 top_k=5
+    │ 获取相似案例的完整信息
+    ▼
+[Step 4] LLM评估 (RAGEvaluator.llm_reasonableness_eval)
+    │ 结合相似案例进行评估
+    │ 输出：is_reasonable, confidence, reasoning
+    ▼
+[Step 5] 人工审核（可选）
+    │ 人工判断是否入库
+    ▼
+【知识库构建】
+    │
+    ├── 存储12维向量到ChromaDB
+    │   └── collection.add(ids=[case_id], embeddings=[embedding],
+    │                        metadatas=[{label, danger_type, evaluated_by}])
+    │
+    ├── 存储轨迹数据到SQLite trajectory_records
+    │
+    ├── 存储评估结果到SQLite evaluation_results
+    │
+    └── 存储案例元数据到SQLite knowledge_base
+```
+
+**入库判定规则**：
+
+| 评估结果 | 置信度 | 人工审核 | 入库 | evaluated_by |
+|---------|--------|---------|------|-------------|
+| is_reasonable=true | ≥0.8 | 否 | 是 | llm_auto |
+| is_reasonable=true | <0.8 | 是 | 审核后 | human/llm_auto |
+| is_reasonable=false | any | 否 | 否 | llm_auto |
+
+### 5.4 向量化编码器 (rag/embedding_encoder.py)
+
+#### 5.4.1 功能说明
 
 将轨迹数据编码为12维特征向量，用于ChromaDB存储和相似度检索。
 
-#### 5.3.2 编码流程
+#### 5.4.2 编码流程
 
 ```
 原始轨迹数据
@@ -518,16 +814,25 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
     ↓
 空间特征（横向偏移、曲率）
     ↓
-归一化处理
+归一化处理（L2归一化）
     ↓
 12维特征向量
 ```
 
-#### 5.3.3 编码器接口
+#### 5.4.3 编码器接口
 
 ```python
 class TrajectoryEncoder:
     """轨迹向量化编码器"""
+
+    # 12维特征向量定义
+    FEATURE_NAMES = [
+        'mean_speed', 'max_speed', 'speed_std',      # 速度统计 (3)
+        'mean_accel', 'max_accel',                    # 加速度统计 (2)
+        'max_lateral_offset', 'lateral_std',         # 横向运动 (2)
+        'min_ttc', 'mean_ttc',                       # 安全指标 (2)
+        'trajectory_length', 'max_curvature'          # 几何特征 (2)
+    ]
 
     def encode(self, trajectory: Trajectory) -> np.ndarray:
         """
@@ -553,7 +858,8 @@ class TrajectoryEncoder:
         # 几何特征 (10-11)
         features[10:12] = self._compute_geometric_features(trajectory)
 
-        return features
+        # L2归一化
+        return self._normalize(features)
 
     def _normalize(self, features: np.ndarray) -> np.ndarray:
         """L2归一化"""
@@ -561,62 +867,197 @@ class TrajectoryEncoder:
         return features / norm if norm > 0 else features
 ```
 
-### 5.4 RAG检索逻辑 (rag/rag_evaluator.py)
+### 5.5 RAG检索逻辑 (rag/rag_evaluator.py)
 
-#### 5.4.1 检索流程
+#### 5.5.1 检索流程
 
 ```
-新候选轨迹
+新候选轨迹（待评估）
     ↓
-特征提取（12维向量）
+【Step 1】特征提取
+    └── TrajectoryFeatureExtractor.encode() → 12维向量
     ↓
-ChromaDB相似度检索 (top_k=5)
+【Step 2】向量检索
+    └── ChromaDB.query_similar(query_vector, top_k=5)
     ↓
-计算相似度统计
+【Step 3】获取相似案例完整信息
+    ├── 根据case_id查询SQLite knowledge_base
+    ├── 根据trajectory_id查询SQLite trajectory_records
+    └── 根据evaluation_id查询SQLite evaluation_results
     ↓
-判断分支策略
+【Step 4】构建RAG评估上下文
+    ├── 候选轨迹：特征向量 + 物理验证结果
+    ├── 相似案例：轨迹特征 + 评估结果 + 标签
+    └── 危险类型 + 场景描述
     ↓
-标准RAG评估 / LLM深度分析
+【Step 5】LLM合理性评估
+    └── LLM综合判断
 ```
 
-#### 5.4.2 分支判断逻辑
+#### 5.5.2 RAG检索接口
+
+```python
+class RAGEvaluator:
+    """RAG评估器"""
+
+    def __init__(self, sqlite_manager: SQLiteManager, chromadb_manager: ChromaDBInterface):
+        self.sqlite = sqlite_manager
+        self.chromadb = chromadb_manager
+        self.encoder = TrajectoryEncoder()
+
+    def query_similar_cases(
+        self,
+        trajectory_vector: np.ndarray,
+        top_k: int = 5
+    ) -> List[Dict]:
+        """
+        检索相似案例
+
+        Args:
+            trajectory_vector: 12维轨迹特征向量
+            top_k: 返回最相似的K个案例
+
+        Returns:
+            List[Dict]: 相似案例列表，每个包含完整案例信息
+        """
+        # 1. ChromaDB向量检索
+        chroma_results = self.chromadb.query_similar(
+            query_vector=trajectory_vector.tolist(),
+            n_results=top_k
+        )
+
+        # 2. 获取完整案例信息
+        similar_cases = []
+        for case_id, similarity, chroma_metadata in chroma_results:
+            # 查询SQLite获取完整信息
+            kb_record = self.sqlite.get_knowledge_case(case_id)
+            traj_record = self.sqlite.get_trajectory(kb_record.trajectory_id)
+            eval_record = self.sqlite.get_evaluation_by_trajectory(kb_record.trajectory_id)
+
+            similar_cases.append({
+                'case_id': case_id,
+                'similarity': similarity,
+                'label': kb_record.label,
+                'danger_type': kb_record.danger_type,
+                'trajectory_data': traj_record.trajectory_points,  # 用于LLM参考
+                'physics_validation': eval_record.physics_validation,
+                'llm_evaluation': {
+                    'is_reasonable': eval_record.llm_is_reasonable,
+                    'confidence': eval_record.llm_confidence,
+                    'reasoning': eval_record.llm_reasoning
+                }
+            })
+
+        return similar_cases
+```
+
+#### 5.5.3 分支判断逻辑
 
 | 条件 | 处理策略 | 说明 |
 |------|---------|------|
-| max_similarity > 0.75 | 标准RAG评估 | 基于相似案例判断 |
+| max_similarity > 0.75 | 标准RAG评估 | 基于相似案例判断，可信度高 |
 | 0.5 < max_similarity ≤ 0.75 | LLM辅助评估 | 结合相似案例 + LLM分析 |
-| max_similarity ≤ 0.5 | LLM深度分析 | 无足够相似案例 |
+| max_similarity ≤ 0.5 | LLM深度分析 | 无足够相似案例，依赖LLM |
 
-#### 5.4.3 相似度统计指标
+#### 5.5.4 相似度统计指标
 
 | 指标 | 计算方式 | 用途 |
 |------|---------|------|
-| max_similarity | 最高相似度 | 判断是否有相似案例 |
-| avg_similarity | 平均相似度 | 整体相似程度 |
-| min_similarity | 最低相似度 | 排除异常案例 |
-| weighted_similarity | 加权相似度 | 综合考虑多维度 |
+| max_similarity | max(案例相似度列表) | 判断是否有高度相似案例 |
+| avg_similarity | mean(案例相似度列表) | 整体相似程度 |
+| min_similarity | min(案例相似度列表) | 排除异常案例 |
+| reasonable_ratio | 相似案例中reasonable比例 | 辅助判断 |
 
-### 5.5 LLM自补充机制 (rag/self_expansion.py)
+### 5.6 LLM评估Prompt设计（含RAG上下文）
 
-#### 5.5.1 触发条件
+当使用RAG检索到的相似案例时，LLM评估Prompt设计如下：
+
+```markdown
+## 轨迹合理性评估任务
+
+### 背景
+你正在评估自动驾驶测试场景中的危险轨迹。该轨迹是通过对真实驾驶场景进行参数变异生成的。
+
+### 输入信息
+1. **待评估轨迹特征**:
+   - 最大加速度: {max_accel} m/s²
+   - 最大速度: {max_speed} m/s
+   - 最小TTC: {min_ttc} s
+   - 横向偏移范围: [{min_lat}, {max_lat}] m
+   - 危险类型: {danger_type}
+
+2. **物理验证结果**:
+   - 通过状态: {is_physics_valid}
+   - 失败规则: {failed_rules}
+   - 警告信息: {warnings}
+
+3. **RAG检索到的相似案例（共{num_similar_cases}个）**:
+
+{% for case in similar_cases %}
+#### 案例 {{ loop.index }}: {{ case.danger_type }}
+- 相似度: {{ case.similarity }}
+- 标签: {{ case.label }}
+- 评估结果: {{ case.llm_evaluation.is_reasonable }}
+- 置信度: {{ case.llm_evaluation.confidence }}
+- 评估理由: {{ case.llm_evaluation.reasoning }}
+- 物理指标: max_accel={{ case.physics_validation.max_long_accel }}, max_speed={{ case.physics_validation.max_speed }}
+{% endfor %}
+
+### 评估标准
+1. **物理合理性**: 轨迹是否符合车辆动力学约束？
+2. **场景合理性**: 这种驾驶行为在现实中是否可能发生？
+3. **与相似案例一致性**: 与知识库中相似案例的评估结论是否一致？
+4. **危险程度**: 是否构成有效的安全测试场景？
+
+### 输出格式
+```json
+{
+    "is_reasonable": true/false,
+    "confidence": 0.85,
+    "reasoning": "评估理由（需参考相似案例）",
+    "danger_level": "high/medium/low",
+    "consistency_with_cases": "与相似案例的一致性分析"
+}
+```
+```
+
+### 5.7 冷启动策略
+
+```
+系统启动 → 知识库为空
+    ↓
+穷举生成候选轨迹（基于参数空间计算的数量，如7000条）
+    ↓
+物理过滤 → 剩余约700条（过滤率约90%）
+    ↓
+人工审核50条（建立种子库）
+    ↓
+知识库初始化完成
+    ↓
+后续使用RAG辅助评估
+```
+
+### 5.8 LLM自补充机制 (rag/self_expansion.py)
+
+#### 5.8.1 触发条件
 
 当知识库中无足够相似案例时（max_similarity < 0.7），触发LLM自补充机制。
 
-#### 5.5.2 自补充流程
+#### 5.8.2 自补充流程
 
 ```
 LLM深度分析 → 置信度判断
     │
     ├── 置信度 ≥ 0.8 → 自动入库（标记llm_auto）
     │       ↓
-    │       更新知识库 + ChromaDB
+    │       存储到SQLite + ChromaDB
     │
     └── 置信度 < 0.8 → 标记need_human_review
             ↓
         进入人工审核流程
 ```
 
-#### 5.5.3 自动入库案例管理
+#### 5.8.3 自动入库案例管理
 
 | 属性 | 说明 |
 |------|------|
@@ -626,15 +1067,15 @@ LLM深度分析 → 置信度判断
 
 **定期抽检机制**：每周随机抽取5%的llm_auto案例进行人工复核。
 
-### 5.6 知识库维护
+### 5.9 知识库维护
 
-#### 5.6.1 案例生命周期
+#### 5.9.1 案例生命周期
 
 ```
 创建 → 评估 → 入库 → 查询 → 更新/删除
 ```
 
-#### 5.6.2 知识库统计
+#### 5.9.2 知识库统计
 
 | 统计项 | 说明 |
 |-------|------|
@@ -644,13 +1085,14 @@ LLM深度分析 → 置信度判断
 | llm_auto_count | LLM自动入库数 |
 | pending_review_count | 待审核数 |
 
-#### 5.6.3 知识库优化
+#### 5.9.3 知识库优化
 
 | 操作 | 触发条件 | 动作 |
 |------|---------|------|
 | 去重检查 | 入库前 | 基于trajectory_hash查重 |
 | 相似度阈值调整 | 查询命中率<50% | 降低相似度阈值 |
 | 案例清理 | unreasonable比例>60% | 分析原因，调整生成策略 |
+| 向量索引优化 | 案例数>10000 | 重建ChromaDB索引 |
 
 ---
 
@@ -845,10 +1287,12 @@ CREATE INDEX idx_eval_physics_valid ON evaluation_results(is_physics_valid);
 | `trajectory_id` | TEXT | **NOT NULL**, FK | 关联轨迹ID | `traj_20240101_001` |
 | `label` | TEXT | NOT NULL | 标签 | `reasonable` |
 | `danger_type` | TEXT | - | 危险类型 | `cut_in` |
+| `danger_level` | TEXT | - | 危险等级 | `high` |
 | `evaluated_by` | TEXT | - | 评估来源 | `human` |
 | `confidence` | REAL | - | 置信度 | `0.92` |
 | `evaluation_reasoning` | TEXT | - | 评估理由 | `轨迹自然流畅` |
-| `similar_cases` | TEXT | - | 相似案例ID列表JSON | `["case_001", "case_002"]` |
+| `creation_context` | TEXT | - | 生成参数JSON | `{"accel_offset": 2.0, "speed_scale": 1.2}` |
+| `similar_cases` | TEXT | - | 入库时相似案例ID列表JSON | `["case_001", "case_002"]` |
 | `query_count` | INTEGER | DEFAULT 0 | 被查询次数 | `15` |
 | `created_at` | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | 创建时间 | `2024-01-01 10:00:00` |
 | `updated_at` | TIMESTAMP | DEFAULT CURRENT_TIMESTAMP | 更新时间 | `2024-01-01 10:00:00` |
