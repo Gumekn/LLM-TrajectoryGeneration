@@ -32,7 +32,7 @@ Waymo原始数据
     ↓
 [Step 2] 风险计算与危险片段定位
     ↓
-[Step 3] 轨迹特征提取与向量化（12维特征）
+[Step 3] 轨迹特征提取与向量化（11维特征）
     ↓
 【穷举生成阶段】
     ↓
@@ -62,31 +62,36 @@ Waymo原始数据
 
 **数据结构定义**：
 
-```python
-{
-    'object_tracks': {
-        [object_id]: {
-            'type': 'VEHICLE' | 'PEDESTRIAN' | 'CYCLIST' | ...,  # 物体类型
-            'state': {
-                'action': np.ndarray,                    # 动作数据
-                'global_center': np.ndarray (N, 3),     # 全局位置 [x, y, z] 单位:m
-                'heading': np.ndarray (N,),                # 航向角 单位:rad
-                'local_acceleration': np.ndarray (N, 2),  # 局部加速度 [ax, ay] 单位:m/s²
-                'local_velocity': np.ndarray (N, 2),       # 局部速度 [vx, vy] 单位:m/s
-                'size': np.ndarray (N, 3),               # 物体尺寸 [length, width, height] 单位:m
-                'valid': np.ndarray (N,) bool           # 有效标记
-            }
-        }
-    },
-    'map_features': {},        # 静态地图数据（车道线、交通标志等）
-    'dynamic_map_states': {},   # 动态地图状态（交通灯等）
-    'extra_information': {
-        'sdc_id': str,          # 自车（Self-Driving Car）ID
-        'scene_length': int,    # 场景总帧数
-        'timestamp': np.ndarray # 时间戳序列
-    }
-}
-```
+Waymo原始数据结构包含以下主要部分：
+
+| 顶层字段 | 说明 |
+|----------|------|
+| object_tracks | 场景中所有动态物体的轨迹字典，key为物体ID |
+| map_features | 静态地图数据（车道线、交通标志等） |
+| dynamic_map_states | 动态地图状态（交通灯等） |
+| extra_information | 额外信息 |
+
+**object_tracks中每个物体的数据结构**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| type | enum | 物体类型：VEHICLE（车辆）、PEDESTRIAN（行人）、CYCLIST（骑车人）等 |
+| state | dict | 物体状态数据 |
+| state.action | ndarray | 动作数据 |
+| state.global_center | ndarray (N, 3) | 全局位置 [x, y, z]，单位：米 |
+| state.heading | ndarray (N,) | 航向角，单位：弧度 |
+| state.local_acceleration | ndarray (N, 2) | 局部加速度 [ax, ay]，单位：m/s² |
+| state.local_velocity | ndarray (N, 2) | 局部速度 [vx, vy]，单位：m/s |
+| state.size | ndarray (N, 3) | 物体尺寸 [长, 宽, 高]，单位：米 |
+| state.valid | ndarray (N,) bool | 该帧数据是否有效 |
+
+**extra_information包含**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| sdc_id | str | 自车（Self-Driving Car）的ID |
+| scene_length | int | 场景总帧数 |
+| timestamp | ndarray | 时间戳序列 |
 
 **关键变量说明**：
 
@@ -137,17 +142,17 @@ Waymo原始数据
 
 **参数空间大小计算**：
 
-```python
-param_space = {
-    'accel_offset': np.arange(-4, 4.5, 0.5),    # 17个值: -4.0, -3.5, ..., 4.0
-    'speed_scale': np.arange(0.7, 1.6, 0.1),    # 9个值: 0.7, 0.8, ..., 1.5
-    'lateral_offset': np.arange(-2, 2.1, 0.3),  # 14个值: -2.0, -1.7, ..., 2.0
-    'time_shift': np.arange(-1, 1.1, 0.2),      # 11个值: -1.0, -0.8, ..., 1.0
-    'heading_bias': np.arange(-0.3, 0.35, 0.1), # 6个值: -0.3, -0.2, ..., 0.3
-}
+**参数空间定义**：
 
-# 全参数空间组合数：17 × 9 × 14 × 11 × 6 = 141,372 种
-```
+| 参数名 | 取值范围 | 步长 | 值数量 | 变异公式 |
+|--------|----------|------|--------|----------|
+| accel_offset | [-4, 4] m/s² | 0.5 | 17 | accel_new = accel_base + offset |
+| speed_scale | [0.7, 1.5] | 0.1 | 9 | vel_new = vel_base × scale |
+| lateral_offset | [-2, 2] m | 0.3 | 14 | y_new = y_base + offset |
+| time_shift | [-1, 1] s | 0.2 | 11 | 插值重采样 |
+| heading_bias | [-0.3, 0.3] rad | 0.1 | 6 | heading_new = heading_base + bias |
+
+**全参数空间组合数**：17 × 9 × 14 × 11 × 6 = **141,372** 种
 
 **采样数量确定原则**：
 
@@ -189,97 +194,31 @@ n_final = n_candidates × (1 - 物理过滤率) × (1 - LLM过滤率)
 | 分层采样     | 按危险类型分层后再采样   | 多样性要求高   | 80%      |
 | 自适应采样   | 根据评估结果动态调整密度 | 迭代优化阶段   | 可变     |
 
-**网格采样法（推荐作为基线）**：
-```python
-def grid_sampling(param_space, stride=1):
-    """
-    网格采样：每隔stride个步长取一个点
-    
-    Args:
-        param_space: 参数空间定义
-        stride: 采样间隔（1=全采样，2=隔点采样）
-    
-    Returns:
-        List[Dict]: 采样的参数组合列表
-    """
-    keys = list(param_space.keys())
-    values = [param_space[k][::stride] for k in keys]
-    
-    # 生成网格索引
-    from itertools import product
-    grid_indices = product(*[range(len(v)) for v in values])
-    
-    samples = []
-    for indices in grid_indices:
-        sample = {keys[i]: values[i][idx] for i, idx in enumerate(indices)}
-        samples.append(sample)
-    
-    return samples
-```
+**采样策略说明**：
 
-**分层采样法（推荐用于多样性）**：
-```python
-def stratified_sampling(param_space, n_per_layer, danger_types):
-    """
-    分层采样：按危险类型分层后，每层采用网格采样
-    
-    Args:
-        param_space: 参数空间定义
-        n_per_layer: 每个危险类型层的采样数量
-        danger_types: 危险类型列表
-    
-    Returns:
-        Dict[str, List[Dict]]: {danger_type: samples}
-    """
-    samples_by_type = {}
-    
-    for d_type in danger_types:
-        # 根据危险类型调整参数空间
-        adjusted_space = adjust_param_space_by_danger(param_space, d_type)
-        # 每层采样
-        samples_by_type[d_type] = grid_sampling(adjusted_space)[:n_per_layer]
-    
-    return samples_by_type
-```
+1. **网格采样法（推荐作为基线）**：
+   - 原理：对参数空间进行网格划分，确保每个参数维度都被均匀覆盖
+   - 优点：参数空间覆盖完整，可解释性强
+   - 适用场景：冷启动阶段，作为基线策略
 
-**自适应采样法（推荐用于迭代优化）**：
-```python
-def adaptive_sampling(param_space, initial_n, evaluation_results, target_approved=50):
-    """
-    自适应采样：根据评估结果动态调整采样密度
-    
-    Args:
-        param_space: 参数空间定义
-        initial_n: 初始采样数量
-        evaluation_results: 评估结果列表
-        target_approved: 目标通过数量
-    
-    Returns:
-        int: 调整后的采样数量
-    """
-    # 计算当前通过率
-    approved_rate = sum(1 for r in evaluation_results if r['final_status'] == 'approved') / len(evaluation_results)
-    
-    # 预估需要的采样数量
-    if approved_rate > 0:
-        n_needed = int(target_approved / approved_rate)
-    else:
-        n_needed = initial_n * 2  # 如果通过率为0，增加采样
-    
-    # 限制最大最小值
-    return max(initial_n, min(n_needed, 50000))
-```
+2. **分层采样法（推荐用于多样性）**：
+   - 原理：先按危险类型（追尾、切入、正面碰撞等）对参数空间分层，再在各层内进行网格采样
+   - 优点：保证生成轨迹的多样性
+   - 适用场景：需要覆盖多种危险类型时
 
-| 策略         | 推荐采样数量 | 适用阶段 | 说明                   |
-| ------------ | ------------ | -------- | ---------------------- |
-| 网格采样     | 7,000-14,000 | 冷启动/基线 | 确保参数空间完整覆盖   |
-| 分层采样     | 每层500-1000 | 多样性场景 | 平衡各危险类型比例     |
-| 自适应采样   | 动态调整     | 迭代优化 | 根据通过率自动调整     |
-| ------------ | ------------------------ | -------------- |
-| 网格采样     | 均匀覆盖参数空间         | 冷启动阶段     |
-| 危险导向采样 | 优先采样高风险区域       | 已知危险模式后 |
-| 随机采样     | 随机选取参数组合         | 快速验证       |
-| 自适应采样   | 根据评估结果调整采样密度 | 迭代优化阶段   |
+3. **自适应采样法（推荐用于迭代优化）**：
+   - 原理：根据前一轮评估结果动态调整采样密度，高通过率区域增加采样，低通过率区域减少采样
+   - 优点：提高生成效率，聚焦于更有希望的参数区域
+   - 适用场景：迭代优化阶段
+
+4. **危险导向采样**：
+   - 原理：优先在TTC<1s等高风险参数区域进行采样
+   - 适用场景：已知危险模式后，提高危险轨迹生成概率
+
+5. **随机采样**：
+   - 原理：从参数空间中随机选取参数组合
+   - 优点：实现简单，快速
+   - 适用场景：快速验证
 
 ---
 
@@ -370,35 +309,20 @@ LLM-2/
 
 #### 4.1.2 生成算法
 
-```python
-def generate_trajectories(base_trajectory, param_space, n_samples=1000):
-    """
-    基于参数空间生成候选轨迹
-  
-    Args:
-        base_trajectory: 原始危险片段轨迹
-        param_space: 参数空间定义
-        n_samples: 采样数量
-  
-    Returns:
-        List[Trajectory]: 候选轨迹列表
-    """
-    candidates = []
-  
-    for i in range(n_samples):
-        # 采样参数
-        params = sample_parameters(param_space)
-    
-        # 应用变异
-        variant = apply_variation(base_trajectory, params)
-    
-        # 轨迹平滑（插值）
-        variant = smooth_trajectory(variant)
-    
-        candidates.append(variant)
-  
-    return candidates
-```
+轨迹生成的核心逻辑包括以下步骤：
+
+1. **参数采样**：根据选定的采样策略（如网格采样、分层采样等），从参数空间中选取一组变异参数
+
+2. **变异应用**：将采样得到的参数应用到原始轨迹上，生成变异后的轨迹。变异操作包括：
+   - 速度缩放：改变轨迹的速度大小
+   - 加速度偏移：在原有加速度基础上增加偏移量
+   - 横向偏移：改变轨迹的横向位置
+   - 时间偏移：调整轨迹的时间轴
+   - 航向偏移：改变轨迹的行驶方向
+
+3. **轨迹平滑**：对变异后的轨迹进行平滑处理，确保轨迹的连续性和物理合理性
+
+4. **结果收集**：将生成的候选轨迹加入候选集，重复直到达到目标数量
 
 #### 4.1.3 变异操作
 
@@ -437,6 +361,39 @@ def generate_trajectories(base_trajectory, param_space, n_samples=1000):
 | -------- | ---------- | ----------- | ------------ |
 | WARN-001 | Jerk变化率 | ≤ 10 m/s³ | 标记但不剔除 |
 | WARN-002 | 曲率变化   | 连续        | 标记但不剔除 |
+
+#### 4.2.3 碰撞检测算法
+
+采用**点距离检测法**进行精确碰撞检测：
+
+**原理**：将车辆简化为4个角点，检测任意两车角点之间的最小距离。
+
+```
+     车辆角点
+        Front
+          ↑
+    p1 ──────── p2
+     │    ●●●●  │
+     │    ●●●●  │  ← 4个角点(p1,p2,p3,p4)
+    p4 ──────── p3
+```
+
+**检测逻辑**：
+
+碰撞检测采用点距离检测法，核心步骤如下：
+
+1. **角点计算**：根据车辆尺寸（长、宽）和当前帧的航向角，计算车辆在全局坐标系下的4个角点位置
+
+2. **距离计算**：遍历两车所有对应帧的角点组合，计算每对角点之间的欧氏距离，找出最小距离
+
+3. **碰撞判定**：将最小距离与阈值比较，若小于阈值则判定为碰撞
+
+**阈值选择建议**：
+| 阈值 | 适用场景 |
+|------|---------|
+| 0.2m | 高精度要求，严格检测 |
+| 0.3m | **推荐默认值** |
+| 0.5m | 宽松检测，减少误报 |
 
 ---
 
@@ -498,7 +455,7 @@ def generate_trajectories(base_trajectory, param_space, n_samples=1000):
 
 #### 4.4.1 功能说明
 
-将轨迹数据转换为12维特征向量，用于RAG检索和相似度计算。
+将轨迹数据转换为11维特征向量，用于RAG检索和相似度计算。
 
 #### 4.4.2 特征定义
 
@@ -518,21 +475,21 @@ def generate_trajectories(base_trajectory, param_space, n_samples=1000):
 
 #### 4.4.3 数据结构
 
-```python
-class TrajectoryFeatures:
-    """12维轨迹特征向量"""
-    mean_speed: float      # 平均速度 (m/s)
-    max_speed: float       # 最大速度 (m/s)
-    speed_std: float       # 速度标准差 (m/s)
-    mean_accel: float      # 平均加速度 (m/s²)
-    max_accel: float       # 最大加速度 (m/s²)
-    max_lateral_offset: float  # 最大横向偏移 (m)
-    lateral_std: float     # 横向偏移标准差 (m)
-    min_ttc: float         # 最小TTC (s)
-    mean_ttc: float        # 平均TTC (s)
-    trajectory_length: float  # 轨迹长度 (m)
-    max_curvature: float   # 最大曲率 (1/m)
-```
+**TrajectoryFeatures** 包含以下11个字段，用于描述一条轨迹的核心特征：
+
+| 分类 | 字段名 | 数据类型 | 单位 | 说明 |
+|------|--------|----------|------|------|
+| 速度统计 | mean_speed | float | m/s | 轨迹段内所有帧速度的平均值，反映整体行驶速度水平 |
+| | max_speed | float | m/s | 轨迹段内速度的最大值，反映峰值速度 |
+| | speed_std | float | m/s | 速度的标准差，反映速度波动程度 |
+| 加速度统计 | mean_accel | float | m/s² | 加速度平均值，反映整体加减速强度 |
+| | max_accel | float | m/s² | 加速度最大值（包括加减速） |
+| 横向运动 | max_lateral_offset | float | m | 相对于初始位置的横向最大偏移，反映换道幅度 |
+| | lateral_std | float | m | 横向偏移的标准差，反映横向波动程度 |
+| 安全指标 | min_ttc | float | s | 轨迹段内TTC的最小值，表示最危险时刻 |
+| | mean_ttc | float | s | TTC的平均值，反映整体危险程度 |
+| 几何特征 | trajectory_length | float | m | 轨迹的总长度，即累计行驶距离 |
+| | max_curvature | float | 1/m | 轨迹曲率的最大值，反映最大转向程度 |
 
 ---
 
@@ -564,15 +521,15 @@ TTC = D / Vr  (当 Vr > 0 且 D > 0)
 
 #### 4.5.4 输出数据
 
-```python
-class RiskAnalysisResult:
-    """风险分析结果"""
-    anchor_frame: int      # 最危险帧索引
-    max_risk_score: float # 最大风险分数
-    risk_trajectory: List[float]  # 各帧风险分数
-    ttc_trajectory: List[float]   # 各帧TTC值
-    danger_type: str      # 危险类型: rear_end/cut_in/head_on/side_swipe
-```
+风险分析完成后，输出以下信息：
+
+| 输出字段 | 数据类型 | 说明 |
+|----------|----------|------|
+| anchor_frame | int | 最危险帧在原始场景中的帧索引 |
+| max_risk_score | float | 整条轨迹的最大风险分数 |
+| risk_trajectory | List[float] | 每一帧对应的风险分数序列 |
+| ttc_trajectory | List[float] | 每一帧计算得到的TTC值序列 |
+| danger_type | str | 危险类型，取值范围：rear_end（追尾）、cut_in（切入）、head_on（正面碰撞）、side_swipe（侧向刮擦） |
 
 ---
 
@@ -592,19 +549,17 @@ class RiskAnalysisResult:
 
 #### 4.6.3 同步输出
 
-截取后的片段包含主车和交互车的同步轨迹：
+截取后的轨迹片段包含以下信息：
 
-```python
-class SynchronizedFragment:
-    """同步轨迹片段"""
-    scenario_id: str
-    anchor_frame: int
-    ego_trajectory: List[TrajectoryPoint]  # 主车轨迹
-    target_trajectory: List[TrajectoryPoint]  # 交互车轨迹
-    relative_features: RelativeFeatures    # 相对运动特征
-    duration: float   # 片段时长 (s)
-    frame_count: int  # 总帧数
-```
+| 输出字段 | 数据类型 | 说明 |
+|----------|----------|------|
+| scenario_id | str | 原始场景的唯一标识 |
+| anchor_frame | int | 最危险帧在原始场景中的索引 |
+| ego_trajectory | List[TrajectoryPoint] | 主车（自车）在片段时间范围内的完整轨迹点序列 |
+| target_trajectory | List[TrajectoryPoint] | 交互车（目标车）在片段时间范围内的完整轨迹点序列，与主车同步 |
+| relative_features | RelativeFeatures | 主车与交互车之间的相对运动特征，包括相对距离、相对速度、相对角度等 |
+| duration | float | 片段的时长，单位为秒 |
+| frame_count | int | 片段包含的总帧数 |
 
 ---
 
@@ -624,6 +579,8 @@ class SynchronizedFragment:
 
 #### 4.7.3 坐标系转换
 
+> **⚠️ 待验证问题**：Waymo → CARLA 坐标转换公式尚未验证，实现前需参考CARLA官方文档或实际测试确认。
+
 Waymo → CARLA 坐标转换：
 
 | 维度 | Waymo | CARLA |
@@ -635,28 +592,13 @@ Waymo → CARLA 坐标转换：
 
 #### 4.7.4 转换函数
 
-```python
-def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
-    """
-    Waymo轨迹转CARLA格式
+坐标系转换需要处理以下要素的变换：
 
-    Args:
-        waymo_trajectory: Waymo格式轨迹点列表
+1. **位置转换**：Waymo使用右手坐标系（X向前，Y向左，Z向上），CARLA使用左手坐标系。需要将X坐标取反，Y和Z根据具体定义进行交换
+2. **航向角转换**：Waymo中heading为弧度，CARLA中需要转换为度
+3. **速度转换**：速度向量同样需要进行坐标系的变换
 
-    Returns:
-        List[CarlaState]: CARLA格式状态列表
-    """
-    carla_states = []
-    for point in waymo_trajectory:
-        carla_state = CarlaState(
-            timestamp=point.timestamp,
-            location=(point.x * -1, point.z, point.y),  # 坐标系转换
-            rotation=(0, point.heading * 180 / np.pi, 0),
-            velocity=(point.vx * -1, point.vz, point.vy)
-        )
-        carla_states.append(carla_state)
-    return carla_states
-```
+转换过程中需要注意timestamp的保持，确保时序信息一致。
 
 ---
 
@@ -702,7 +644,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
 │  │  ┌─────────────────────────────────────────────────────┐   │   │
 │  │  │         knowledge_base_vectors (向量集合)             │   │   │
 │  │  │  - id: case_id                                       │   │   │
-│  │  │  - embedding: 12维特征向量                             │   │   │
+│  │  │  - embedding: 11维特征向量                             │   │   │
 │  │  │  - metadata: {label, danger_type, evaluated_by}      │   │   │
 │  │  └─────────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────────┘   │
@@ -717,7 +659,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
 |------|--------|----------|------|-----------------|
 | **标识** | `case_id` | string | 唯一标识 | 自动生成：`case_{timestamp}_{hash}` |
 | **关联** | `trajectory_id` | string | 关联轨迹ID | 外键关联trajectory_records |
-| **向量特征** | `embedding` | vector[12] | 12维特征向量 | TrajectoryFeatureExtractor计算，存ChromaDB |
+| **向量特征** | `embedding` | vector[11] | 11维特征向量 | TrajectoryFeatureExtractor计算，存ChromaDB |
 | **轨迹数据** | `trajectory_data` | JSON | 完整轨迹点序列 | trajectory_records存储，关联查询获取 |
 | **物理验证** | `physics_validation` | JSON | 物理指标验证结果 | PhysicsValidator输出 |
 | | - `max_long_accel` | float | 最大纵向加速度 | 计算 |
@@ -742,7 +684,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
 
 | 数据类型 | 存储位置 | 存储格式 |
 |---------|---------|---------|
-| 12维特征向量 | ChromaDB | float32[12] |
+| 11维特征向量 | ChromaDB | float32[11] |
 | 轨迹原始数据 | SQLite trajectory_records | BLOB (pickle) |
 | 物理验证结果 | SQLite evaluation_results | JSON |
 | LLM评估结果 | SQLite evaluation_results | JSON |
@@ -762,7 +704,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
     │ 输出：ValidationResult
     ▼
 [Step 2] 特征提取 (TrajectoryFeatureExtractor)
-    │ 提取12维特征向量
+    │ 提取11维特征向量
     │ 输出：embedding[12]
     ▼
 [Step 3] RAG检索 (RAGEvaluator.query_similar_cases)
@@ -778,7 +720,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
     ▼
 【知识库构建】
     │
-    ├── 存储12维向量到ChromaDB
+    ├── 存储11维向量到ChromaDB
     │   └── collection.add(ids=[case_id], embeddings=[embedding],
     │                        metadatas=[{label, danger_type, evaluated_by}])
     │
@@ -801,7 +743,7 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
 
 #### 5.4.1 功能说明
 
-将轨迹数据编码为12维特征向量，用于ChromaDB存储和相似度检索。
+将轨迹数据编码为11维特征向量，用于ChromaDB存储和相似度检索。
 
 #### 5.4.2 编码流程
 
@@ -816,56 +758,20 @@ def waymo_to_carla(waymo_trajectory: List[WaymoPoint]) -> List[CarlaState]:
     ↓
 归一化处理（L2归一化）
     ↓
-12维特征向量
+11维特征向量
 ```
 
 #### 5.4.3 编码器接口
 
-```python
-class TrajectoryEncoder:
-    """轨迹向量化编码器"""
+TrajectoryEncoder 负责将轨迹数据编码为11维特征向量，编码流程包括：
 
-    # 12维特征向量定义
-    FEATURE_NAMES = [
-        'mean_speed', 'max_speed', 'speed_std',      # 速度统计 (3)
-        'mean_accel', 'max_accel',                    # 加速度统计 (2)
-        'max_lateral_offset', 'lateral_std',         # 横向运动 (2)
-        'min_ttc', 'mean_ttc',                       # 安全指标 (2)
-        'trajectory_length', 'max_curvature'          # 几何特征 (2)
-    ]
+1. **运动学特征提取**：从轨迹中计算速度、加速度等运动学量，提取统计特征（均值、最大值、标准差）
+2. **空间特征提取**：计算横向偏移的相关特征
+3. **安全指标提取**：计算TTC相关指标
+4. **几何特征提取**：计算轨迹长度、曲率等几何属性
+5. **归一化处理**：对特征向量进行L2归一化，使得不同轨迹的特征具有可比性
 
-    def encode(self, trajectory: Trajectory) -> np.ndarray:
-        """
-        将轨迹编码为12维特征向量
-
-        Args:
-            trajectory: 轨迹对象
-
-        Returns:
-            np.ndarray: 12维特征向量
-        """
-        features = np.zeros(12)
-
-        # 运动学特征 (0-4)
-        features[0:5] = self._compute_kinematic_features(trajectory)
-
-        # 空间特征 (5-6)
-        features[5:7] = self._compute_spatial_features(trajectory)
-
-        # 安全指标 (7-9)
-        features[7:10] = self._compute_safety_features(trajectory)
-
-        # 几何特征 (10-11)
-        features[10:12] = self._compute_geometric_features(trajectory)
-
-        # L2归一化
-        return self._normalize(features)
-
-    def _normalize(self, features: np.ndarray) -> np.ndarray:
-        """L2归一化"""
-        norm = np.linalg.norm(features)
-        return features / norm if norm > 0 else features
-```
+编码后的特征向量用于后续的RAG相似度检索。
 
 ### 5.5 RAG检索逻辑 (rag/rag_evaluator.py)
 
@@ -875,7 +781,7 @@ class TrajectoryEncoder:
 新候选轨迹（待评估）
     ↓
 【Step 1】特征提取
-    └── TrajectoryFeatureExtractor.encode() → 12维向量
+    └── TrajectoryFeatureExtractor.encode() → 11维向量
     ↓
 【Step 2】向量检索
     └── ChromaDB.query_similar(query_vector, top_k=5)
@@ -896,60 +802,16 @@ class TrajectoryEncoder:
 
 #### 5.5.2 RAG检索接口
 
-```python
-class RAGEvaluator:
-    """RAG评估器"""
+RAGEvaluator 的检索流程如下：
 
-    def __init__(self, sqlite_manager: SQLiteManager, chromadb_manager: ChromaDBInterface):
-        self.sqlite = sqlite_manager
-        self.chromadb = chromadb_manager
-        self.encoder = TrajectoryEncoder()
+1. **向量检索**：将待评估轨迹的11维特征向量作为查询向量，在ChromaDB中进行相似度检索，返回top_k个最相似的案例
 
-    def query_similar_cases(
-        self,
-        trajectory_vector: np.ndarray,
-        top_k: int = 5
-    ) -> List[Dict]:
-        """
-        检索相似案例
+2. **信息补全**：根据检索返回的case_id，在SQLite数据库中查询对应的完整案例信息，包括：
+   - 轨迹原始数据（用于LLM参考）
+   - 物理验证结果
+   - 历史评估结果（是否合理、置信度、评估理由）
 
-        Args:
-            trajectory_vector: 12维轨迹特征向量
-            top_k: 返回最相似的K个案例
-
-        Returns:
-            List[Dict]: 相似案例列表，每个包含完整案例信息
-        """
-        # 1. ChromaDB向量检索
-        chroma_results = self.chromadb.query_similar(
-            query_vector=trajectory_vector.tolist(),
-            n_results=top_k
-        )
-
-        # 2. 获取完整案例信息
-        similar_cases = []
-        for case_id, similarity, chroma_metadata in chroma_results:
-            # 查询SQLite获取完整信息
-            kb_record = self.sqlite.get_knowledge_case(case_id)
-            traj_record = self.sqlite.get_trajectory(kb_record.trajectory_id)
-            eval_record = self.sqlite.get_evaluation_by_trajectory(kb_record.trajectory_id)
-
-            similar_cases.append({
-                'case_id': case_id,
-                'similarity': similarity,
-                'label': kb_record.label,
-                'danger_type': kb_record.danger_type,
-                'trajectory_data': traj_record.trajectory_points,  # 用于LLM参考
-                'physics_validation': eval_record.physics_validation,
-                'llm_evaluation': {
-                    'is_reasonable': eval_record.llm_is_reasonable,
-                    'confidence': eval_record.llm_confidence,
-                    'reasoning': eval_record.llm_reasoning
-                }
-            })
-
-        return similar_cases
-```
+3. **结果组装**：将相似度得分与案例完整信息组装后返回，供后续LLM评估使用
 
 #### 5.5.3 分支判断逻辑
 
@@ -1173,7 +1035,7 @@ LLM深度分析 → 置信度判断
                             ├──────────────────┤ ├──────────────────┤
                             │ case_id (PK)     │ │ review_id (PK)   │
                             │ trajectory_id(FK) │ │ trajectory_id(FK)│
-                            │ embedding [12维] │ │ evaluation_id(FK)│
+                            │ embedding [11维] │ │ evaluation_id(FK)│
                             │ label            │ │ review_status    │
                             │ confidence        │ │ corrected_label  │
                             └──────────────────┘ └──────────────────┘
@@ -1218,7 +1080,7 @@ CREATE INDEX idx_scenario_source ON scenario_metadata(source_dataset);
 | `vehicle_id` | TEXT | NOT NULL | 车辆ID | `312` |
 | `parent_trajectory_id` | TEXT | FK (self) | 父轨迹ID（用于变异追踪） | `traj_20240101_000` |
 | `trajectory_data` | BLOB | - | 序列化的轨迹点列表 | (二进制) |
-| `feature_vector` | BLOB | - | 12维特征向量 | (二进制) |
+| `feature_vector` | BLOB | - | 11维特征向量 | (二进制) |
 | `danger_type` | TEXT | - | 危险类型枚举 | `cut_in` |
 | `danger_level` | TEXT | - | 危险等级 | `high` |
 | `generation_batch` | TEXT | - | 生成批次 | `batch_001` |
@@ -1302,10 +1164,10 @@ CREATE INDEX idx_eval_physics_valid ON evaluation_results(is_physics_valid);
 | 字段 | 类型 | 维度 | 说明 |
 |------|------|------|------|
 | `id` | string | - | 唯一ID，等于case_id |
-| `embedding` | float32[] | 12 | 轨迹12维特征向量 |
+| `embedding` | float32[] | 11 | 轨迹11维特征向量 |
 | `metadata` | dict | - | label、danger_type等 |
 
-**12维特征向量定义：**
+**11维特征向量定义：**
 
 | 索引 | 特征名 | 说明 |
 |------|--------|------|
@@ -1410,7 +1272,7 @@ CREATE INDEX idx_review_status ON human_reviews(review_status);
 │       │                                                                       │
 │       ▼                                                                       │
 │  ┌─────────────────┐                                                      │
-│  │ 特征提取模块     │ ──12维向量──> │ ChromaDB │ query_similar(top_k=5)  │
+│  │ 特征提取模块     │ ──11维向量──> │ ChromaDB │ query_similar(top_k=5)  │
 │  └─────────────────┘              └─────┬─────┘                           │
 │                                          │                                   │
 │                                          ▼                                   │
@@ -1589,29 +1451,12 @@ tests/
 
 ### 9.2 代码注释规范
 
-```python
-def function_name(param: Type) -> ReturnType:
-    """
-    函数简短描述
-  
-    Args:
-        param: 参数说明
-  
-    Returns:
-        返回值说明
-  
-    Raises:
-        ExceptionType: 异常说明
-  
-    Example:
-        >>> result = function_name(value)
-        >>> print(result)
-  
-    References:
-        - 相关论文/文档链接
-    """
-    pass
-```
+所有函数应遵循以下注释规范：
+
+- **函数文档字符串（docstring）**：说明函数功能、参数、返回值、异常和示例
+- **行内注释**：解释复杂逻辑或关键计算
+- **类型注解**：为函数参数和返回值提供类型信息
+- **示例代码**：提供函数用法的示例
 
 ---
 
