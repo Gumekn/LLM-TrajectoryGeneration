@@ -1661,27 +1661,65 @@ tests/
 
 ```
 TrajectoryAnalysis/
+├── core/                           # 核心处理模块
+│   ├── Main.py                     # 主程序入口（Step 1-4 调度）
+│   ├── processor.py                # 整合模块（见下方模块清单）
+│   └── __init__.py                 # 模块导出
+│
+├── rag/                            # RAG知识库模块（待实现）
+│   └── __init__.py
+│
+├── ui/                             # 用户界面模块（待实现）
+│   └── __init__.py
+│
+├── utils/                          # 工具函数模块（待实现）
+│   └── __init__.py
+│
 ├── docs/                           # 文档目录
 │   ├── 项目框架（claude）.md      # 本文档
 │   ├── 项目执行计划_详细版.md     # 详细执行计划
 │   ├── Week1执行总结.md          # Week 1执行总结
 │   └── 轨迹生成模块设计.md       # 轨迹生成模块设计
 │
-├── core/                           # 核心处理模块
-│   ├── __init__.py                 # 模块导出
-│   └── processor.py                # 整合：数据类型、数据加载、风险计算、片段截取
-│
-├── Main.py                         # 主程序入口
-│
 ├── data/                           # 数据目录
 │   ├── waymo-open/                # 原始Waymo数据（pkl）
 │   └── processed/                  # 处理后数据（JSON格式）
+│
+├── 素材参考/                        # 归档素材文件
 │
 ├── requirements.txt               # 依赖管理
 └── .gitignore                     # Git忽略规则
 ```
 
-### 配置参数（Main.py顶部）
+### 模块组织原则
+
+**重要设计原则**：模块不必独立成文件，可以是函数或类，整合在同一文件中。
+
+每个函数/类必须明确标注：
+1. **所在文件**：函数/类在哪个文件中定义
+2. **调用位置**：哪个文件/函数调用它
+3. **功能说明**：做什么
+
+示例（core/processor.py）：
+```python
+class WaymoDataLoader:
+    """Waymo数据加载器
+
+    被使用于:
+        - core/Main.py main() 创建实例
+        - ScenarioProcessor.__init__() 创建数据加载器
+    """
+
+class ScenarioRiskAnalyzer:
+    """场景风险分析器
+
+    被使用于:
+        - core/Main.py run_pipeline() 分析所有车辆风险
+        - ScenarioProcessor.process_scenario() 分析关键车辆
+    """
+```
+
+### 配置参数（core/Main.py顶部）
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
@@ -1697,7 +1735,7 @@ TrajectoryAnalysis/
 
 ---
 
-*文档版本: v2.2*
+*文档版本: v2.3*
 *技术方案: 穷举生成 + LLM剪枝*
 *最后更新: 2026-04-12*
 *Week 1完成状态: ✓ 已完成（优化版）*
