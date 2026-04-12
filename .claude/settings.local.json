@@ -15,7 +15,8 @@
       "Bash(head -1707 \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\docs\\\\项目框架（claude）.md\")",
       "Bash(mv /tmp/trimmed.md \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\docs\\\\项目框架（claude）.md\")",
       "Bash(python:*)",
-      "Bash(git reset:*)"
+      "Bash(git reset:*)",
+      "Bash(git fetch:*)"
     ]
   }
 }
