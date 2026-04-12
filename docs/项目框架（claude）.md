@@ -1,4 +1,4 @@
-# 危险轨迹生成与评估系统 - 穷举生成+LLM剪枝版
+﻿# 危险轨迹生成与评估系统 - 穷举生成+LLM剪枝版
 
 ## 项目概述
 
@@ -241,14 +241,12 @@ LLM-2/
 │   ├── test_rag_evaluator.py       # RAG评估测试
 │   └── conftest.py                 # pytest配置
 │
-├── core/                           # 核心处理模块（学术部分）
-│   ├── __init__.py
-│   ├── data_loader.py              # Step 1: 数据加载
-│   ├── risk_calculator.py          # Step 2: 风险计算
-│   ├── fragment_extractor.py       # Step 2: 片段截取
-│   ├── feature_extractor.py        # Step 3: 特征提取
-│   ├── trajectory_generator.py     # Step 4: 穷举生成器
-│   ├── physics_validator.py        # Step 5: 物理验证
+├── core/                           # 核心处理模块（已实现✓）
+│   ├── __init__.py                 # 模块导出
+│   └── processor.py                # 整合模块：数据类型、数据加载、风险计算、片段截取
+│   # 以下模块待实现
+│   ├── trajectory_generator.py     # Step 5: 穷举生成器
+│   ├── physics_validator.py        # Step 6: 物理验证
 │   └── carla_adapter.py            # Step 9: CARLA导出
 │
 ├── rag/                            # RAG知识库模块
@@ -274,8 +272,8 @@ LLM-2/
 │   └── config.py                   # 配置管理
 │
 ├── data/                           # 数据目录（gitignore）
-│   ├── raw/                        # 原始Waymo数据
-│   ├── processed/                  # 处理后数据
+│   ├── waymo-open/                # 原始Waymo数据（pkl）
+│   ├── processed/                  # 处理后数据（JSON，第一阶段）
 │   ├── generated/                  # 生成的候选轨迹
 │   ├── validated/                  # 物理验证通过
 │   ├── evaluated/                  # LLM评估结果
@@ -491,39 +489,51 @@ LLM-2/
 
 将轨迹数据转换为11维特征向量，用于RAG检索和相似度计算。
 
-#### 4.4.2 特征定义
+> **⚠️ 已更新**：原设计特征定义与实际实现不符，已于Week 1修正。
 
-| 索引 | 特征名 | 计算方式 | 物理意义 |
-|------|--------|---------|---------|
-| 0 | mean_speed | 平均速度 | 整体行驶速度水平 |
-| 1 | max_speed | 最大速度 | 峰值速度 |
-| 2 | speed_std | 速度标准差 | 速度波动程度 |
-| 3 | mean_accel | 平均加速度 | 整体加减速强度 |
-| 4 | max_accel | 最大加速度 | 峰值加速度 |
-| 5 | max_lateral_offset | 最大横向偏移 | 最大换道幅度 |
-| 6 | lateral_std | 横向偏移标准差 | 横向波动程度 |
-| 7 | min_ttc | 最小TTC | 最危险时刻 |
-| 8 | mean_ttc | 平均TTC | 整体危险程度 |
-| 9 | trajectory_length | 轨迹长度 | 总行驶距离 |
-| 10 | max_curvature | 最大曲率 | 最大转向程度 |
+#### 4.4.2 特征定义（已修正）
 
-#### 4.4.3 数据结构
+| 索引 | 特征名 | 计算方式 | 单位 | 说明 |
+|------|--------|---------|------|------|
+| 0 | mean_speed | mean(\|v\|) | m/s | 交互车平均速度 |
+| 1 | max_speed | max(\|v\|) | m/s | 交互车最大速度 |
+| 2 | speed_std | std(\|v\|) | m/s | 速度波动程度 |
+| 3 | mean_accel | mean(\|a\|) | m/s² | 交互车平均加速度 |
+| 4 | max_accel | max(\|a\|) | m/s² | 交互车最大加速度 |
+| 5 | min_ttc_long | min(TTC_long) | s | 最小纵向TTC |
+| 6 | mean_ttc_long | mean(TTC_long) | s | 平均纵向TTC |
+| 7 | min_rel_dist | min(rel_dist) | m | 最小相对距离 |
+| 8 | max_closing_speed | max(-v_long) | m/s | 最大接近速度 |
+| 9 | trajectory_length | sum(\|ds\|) | m | 行驶距离 |
+| 10 | max_curvature | max(\|dθ/ds\|) | 1/m | 最大曲率 |
+
+#### 4.4.3 特征分类
+
+**第一部分：交互车轨迹特征（0-4）**
+- 基于交互车自身运动状态计算
+- 反映交互车的驾驶行为特征
+
+**第二部分：交互特征（5-10）**
+- 基于主车-交互车相对运动计算
+- 反映危险交互的严重程度
+
+#### 4.4.4 数据结构
 
 **TrajectoryFeatures** 包含以下11个字段，用于描述一条轨迹的核心特征：
 
 | 分类 | 字段名 | 数据类型 | 单位 | 说明 |
 |------|--------|----------|------|------|
-| 速度统计 | mean_speed | float | m/s | 轨迹段内所有帧速度的平均值，反映整体行驶速度水平 |
-| | max_speed | float | m/s | 轨迹段内速度的最大值，反映峰值速度 |
-| | speed_std | float | m/s | 速度的标准差，反映速度波动程度 |
-| 加速度统计 | mean_accel | float | m/s² | 加速度平均值，反映整体加减速强度 |
-| | max_accel | float | m/s² | 加速度最大值（包括加减速） |
-| 横向运动 | max_lateral_offset | float | m | 相对于初始位置的横向最大偏移，反映换道幅度 |
-| | lateral_std | float | m | 横向偏移的标准差，反映横向波动程度 |
-| 安全指标 | min_ttc | float | s | 轨迹段内TTC的最小值，表示最危险时刻 |
-| | mean_ttc | float | s | TTC的平均值，反映整体危险程度 |
-| 几何特征 | trajectory_length | float | m | 轨迹的总长度，即累计行驶距离 |
-| | max_curvature | float | 1/m | 轨迹曲率的最大值，反映最大转向程度 |
+| 速度统计 | mean_speed | float | m/s | 交互车速度均值 |
+| | max_speed | float | m/s | 交互车速度最大值 |
+| | speed_std | float | m/s | 交互车速度标准差 |
+| 加速度统计 | mean_accel | float | m/s² | 交互车加速度均值 |
+| | max_accel | float | m/s² | 交互车加速度最大值 |
+| 交互特征 | min_ttc_long | float | s | 最小纵向TTC |
+| | mean_ttc_long | float | s | 平均纵向TTC |
+| | min_rel_dist | float | m | 最小相对距离 |
+| | max_closing_speed | float | m/s | 最大纵向接近速度 |
+| 几何特征 | trajectory_length | float | m | 交互车行驶距离 |
+| | max_curvature | float | 1/m | 轨迹最大曲率 |
 
 ---
 
@@ -561,9 +571,45 @@ TTC = D / Vr  (当 Vr > 0 且 D > 0)
 |----------|----------|------|
 | anchor_frame | int | 最危险帧在原始场景中的帧索引 |
 | max_risk_score | float | 整条轨迹的最大风险分数 |
-| risk_trajectory | List[float] | 每一帧对应的风险分数序列 |
-| ttc_trajectory | List[float] | 每一帧计算得到的TTC值序列 |
-| danger_type | str | 危险类型，取值范围：rear_end（追尾）、cut_in（切入）、head_on（正面碰撞）、side_swipe（侧向刮擦） |
+| risk_scores | ndarray | 每一帧的风险分数序列 (N, 7) |
+| ttc_long | ndarray | 纵向TTC序列 |
+| ttc_lat | ndarray | 横向TTC序列 |
+| rel_dist | ndarray | 相对距离序列 |
+| danger_type | str | **动态推断**，见下方说明 |
+| danger_level | str | high/medium/low |
+
+#### 4.5.5 危险类型判断（已修正）
+
+> **⚠️ 已更新**：原设计假设简单场景（直道/交叉口），实际需要支持任意场景类型。
+
+**原设计问题**：
+- 原设计预设4种危险类型：rear_end、cut_in、head_on、side_swipe
+- 假设场景为直道或简单交叉口
+
+**解决方案**：
+- **不预设场景类型**，计算所有可能的交互特征
+- 基于实际特征值**动态推断**危险类型
+
+**危险类型推断逻辑**：
+
+```python
+def infer_danger_type(ttc_long, ttc_lat, heading_diff):
+    # 1. 纵向接近为主
+    if min_ttc_long < min_ttc_lat * 0.5 and |mean_heading_diff| < 30°:
+        return "rear_end" if heading_diff > 0 else "head_on"
+
+    # 2. 横向接近为主
+    if min_ttc_lat < min_ttc_long * 0.5:
+        return "cut_in" if |heading_diff| > 45° else "crossing"
+
+    # 3. 混合型
+    return "mixed"
+```
+
+**支持的场景类型**：
+- 直道追尾/对向行驶
+- 交叉口穿行
+- 停车场/匝道等复杂场景
 
 ---
 
@@ -573,13 +619,37 @@ TTC = D / Vr  (当 Vr > 0 且 D > 0)
 
 根据风险分析结果，截取包含危险交互的轨迹片段。
 
+> **⚠️ 已更新**：截取参数由固定帧数改为可配置秒数，增加了边界处理。
+
 #### 4.6.2 截取策略
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| 前置帧数 | 20帧 | 锚点前的帧数 |
-| 后置帧数 | 30帧 | 锚点后的帧数 |
-| 最小片段长度 | 30帧 | 有效片段最小长度 |
+| n_before_sec | 2.0秒 | 锚点前截取时长 |
+| n_after_sec | 3.0秒 | 锚点后截取时长 |
+| 帧数计算 | n_before_frames = n_before_sec × 采样率(10Hz) | 自动计算 |
+| 边界处理 | 自动调整 | 锚点靠近边界时自动扩展 |
+
+**边界处理逻辑**：
+
+```python
+def extract_fragment_slice(anchor_frame, n_before_frames, n_after_frames, total_frames):
+    start = anchor_frame - n_before_frames
+    end = anchor_frame + n_after_frames + 1
+
+    # 左边界处理
+    if start < 0:
+        end -= start
+        start = 0
+
+    # 右边界处理
+    if end > total_frames:
+        start -= (end - total_frames)
+        start = max(0, start)
+        end = total_frames
+
+    return start, end
+```
 
 #### 4.6.3 同步输出
 
@@ -1570,6 +1640,64 @@ tests/
 
 ---
 
-*文档版本: v2.0*
+## 附录：文档更新日志
+
+### 更新记录
+
+| 版本 | 日期 | 更新内容 | 更新人 |
+|------|------|---------|-------|
+| v2.1 | 2026-04-12 | Week 1执行后更新：<br>1. 目录结构：添加types.py，标注已实现模块<br>2. 11维特征定义：完全修正<br>3. 危险类型判断：改为动态推断<br>4. 片段截取策略：改为可配置秒数+边界处理<br>5. 数据目录：raw→waymo-open<br>6. 存储方案：第一阶段使用JSON | Gumekn |
+| v2.2 | 2026-04-12 | Week 1优化更新：<br>1. 风险分数计算：与Data_Processor.py一致<br>2. 默认主车：改为sdc_id，列表中用*标记<br>3. 边界检查：添加should_skip_fragment函数<br>4. 输出文件名：改为{scenario_id}_{ego_id}.json<br>5. 无片段时不生成JSON，输出原因分析<br>6. 代码清理：删除tests/目录，删除未使用代码 | Gumekn |
+
+### Week 1优化后实现状态
+
+| 模块 | 文件 | 状态 | 备注 |
+|------|------|------|------|
+| 核心模块整合 | core/processor.py | ✓ 已实现 | 数据类型、数据加载、风险计算、片段截取 |
+| 主程序 | Main.py | ✓ 已实现 | 含命令行参数 |
+| 存储 | JSON | ✓ 已实现 | 无片段不生成 |
+
+### 当前目录结构
+
+```
+TrajectoryAnalysis/
+├── docs/                           # 文档目录
+│   ├── 项目框架（claude）.md      # 本文档
+│   ├── 项目执行计划_详细版.md     # 详细执行计划
+│   ├── Week1执行总结.md          # Week 1执行总结
+│   └── 轨迹生成模块设计.md       # 轨迹生成模块设计
+│
+├── core/                           # 核心处理模块
+│   ├── __init__.py                 # 模块导出
+│   └── processor.py                # 整合：数据类型、数据加载、风险计算、片段截取
+│
+├── Main.py                         # 主程序入口
+│
+├── data/                           # 数据目录
+│   ├── waymo-open/                # 原始Waymo数据（pkl）
+│   └── processed/                  # 处理后数据（JSON格式）
+│
+├── requirements.txt               # 依赖管理
+└── .gitignore                     # Git忽略规则
+```
+
+### 配置参数（Main.py顶部）
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| DATA_DIR | data/waymo-open | Waymo原始数据目录 |
+| OUTPUT_DIR | data/processed | 处理后数据输出目录 |
+| N_BEFORE_SEC | 2.0 | 锚点前截取时长（秒） |
+| N_AFTER_SEC | 3.0 | 锚点后截取时长（秒） |
+| MIN_BEFORE_FRAMES | 10 | 锚点前最小帧数阈值 |
+| MIN_AFTER_FRAMES | 15 | 锚点后最小帧数阈值 |
+| RISK_THRESHOLD | 3 | 风险分数阈值 |
+| SPEED_THRESHOLD | 0.5 | 速度阈值 (m/s) |
+| SCENARIO_ID | 10135f16cd538e19 | 场景ID |
+
+---
+
+*文档版本: v2.2*
 *技术方案: 穷举生成 + LLM剪枝*
-*最后更新: 2024年*
+*最后更新: 2026-04-12*
+*Week 1完成状态: ✓ 已完成（优化版）*

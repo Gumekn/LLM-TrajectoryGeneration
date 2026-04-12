@@ -4,7 +4,18 @@
       "Bash(git add:*)",
       "Bash(ls:*)",
       "Bash(git commit:*)",
-      "Skill(claude-hud:configure)"
+      "Skill(claude-hud:configure)",
+      "Bash(git push:*)",
+      "Bash(python Main.py)",
+      "Bash(python Main.py --ego-id 1811)",
+      "Bash(python main.py --ego-id 312 --risk-threshold 3)",
+      "Bash(python -c ':*)",
+      "Bash(python main.py)",
+      "Bash(python update_doc.py)",
+      "Bash(head -1707 \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\docs\\\\项目框架（claude）.md\")",
+      "Bash(mv /tmp/trimmed.md \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\docs\\\\项目框架（claude）.md\")",
+      "Bash(python:*)",
+      "Bash(git reset:*)"
     ]
   }
 }
