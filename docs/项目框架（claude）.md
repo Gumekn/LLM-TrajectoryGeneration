@@ -1657,6 +1657,16 @@ tests/
 | 主程序 | Main.py | ✓ 已实现 | 含命令行参数 |
 | 存储 | JSON | ✓ 已实现 | 无片段不生成 |
 
+### LLM意图驱动轨迹变异系统（Week 1扩展）
+
+| 模块 | 文件 | 状态 | 备注 |
+|------|------|------|------|
+| 提示词构建 | core/llm/prompt_builder.py | ✓ 已实现 | 意图类型定义 + SYSTEM_PROMPT + TrajectoryPromptBuilder |
+| LLM客户端 | core/llm/intention_models.py | ✓ 已实现 | UnifiedLLMClient（qwen/openai/gemini） |
+| 调用入口 | core/llm_intention_generator.py | ✓ 已实现 | build_trajectory_prompt + save_fragment_with_intention |
+| 轨迹变异器 | core/trajectory_mutator.py | ✓ 已实现 | 意图驱动轨迹变异 |
+| 测试脚本 | test_step1_prompt.py | ✓ 已实现 | Step 1 提示词构建测试 |
+
 ### 当前目录结构
 
 ```
@@ -1664,7 +1674,14 @@ TrajectoryAnalysis/
 ├── core/                           # 核心处理模块
 │   ├── Main.py                     # 主程序入口（Step 1-4 调度）
 │   ├── processor.py                # 整合模块（见下方模块清单）
-│   └── __init__.py                 # 模块导出
+│   ├── __init__.py                 # 模块导出
+│   ├── llm_intention_generator.py  # LLM意图生成器入口
+│   ├── trajectory_mutator.py       # 意图驱动轨迹变异器
+│   └── llm/                        # LLM相关模块
+│       ├── __init__.py            # 统一导出
+│       ├── config.py              # 配置管理
+│       ├── intention_models.py     # 仅 LLM 客户端 (UnifiedLLMClient)
+│       └── prompt_builder.py        # 提示词构建（意图类型 + SYSTEM_PROMPT + TrajectoryPromptBuilder）
 │
 ├── rag/                            # RAG知识库模块（待实现）
 │   └── __init__.py
@@ -1679,12 +1696,15 @@ TrajectoryAnalysis/
 │   ├── 项目框架（claude）.md      # 本文档
 │   ├── 项目执行计划_详细版.md     # 详细执行计划
 │   ├── Week1执行总结.md          # Week 1执行总结
-│   └── 轨迹生成模块设计.md       # 轨迹生成模块设计
+│   ├── 轨迹生成模块设计.md       # 轨迹生成模块设计
+│   └── LLM意图驱动轨迹变异系统实现计划.md  # LLM系统设计
 │
 ├── data/                           # 数据目录
 │   ├── waymo-open/                # 原始Waymo数据（pkl）
-│   └── processed/                  # 处理后数据（JSON格式）
+│   ├── processed/                  # 处理后数据（JSON格式）
+│   └── intention/                   # 带意图的片段数据
 │
+├── test_step1_prompt.py           # Step 1 提示词构建测试脚本
 ├── 素材参考/                        # 归档素材文件
 │
 ├── requirements.txt               # 依赖管理
@@ -1699,6 +1719,15 @@ TrajectoryAnalysis/
 1. **所在文件**：函数/类在哪个文件中定义
 2. **调用位置**：哪个文件/函数调用它
 3. **功能说明**：做什么
+
+**LLM模块职责划分**：
+
+| 文件 | 职责 |
+|------|------|
+| `core/llm/prompt_builder.py` | **唯一的提示词构建位置**：意图类型定义(DrivingIntention)、系统提示词(SYSTEM_PROMPT)、轨迹提示词构造(TrajectoryPromptBuilder) |
+| `core/llm/intention_models.py` | 仅 LLM 客户端：UnifiedLLMClient 支持 qwen/openai/gemini |
+| `core/llm_intention_generator.py` | 调用入口：组合 prompt_builder 和 intention_models，提供 build_trajectory_prompt()、save_fragment_with_intention() 等 |
+| `core/trajectory_mutator.py` | 轨迹变异器：从意图序列生成变异轨迹 |
 
 示例（core/processor.py）：
 ```python
@@ -1735,7 +1764,8 @@ class ScenarioRiskAnalyzer:
 
 ---
 
-*文档版本: v2.3*
+*文档版本: v2.4*
 *技术方案: 穷举生成 + LLM剪枝*
-*最后更新: 2026-04-12*
+*最后更新: 2026-04-14*
 *Week 1完成状态: ✓ 已完成（优化版）*
+*LLM系统状态: ✓ Step 1 提示词构建已完成并测试通过*
