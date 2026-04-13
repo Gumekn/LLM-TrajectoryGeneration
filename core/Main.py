@@ -21,7 +21,10 @@ import sys
 import argparse
 from typing import List, Dict, Optional
 
-from core import (
+# 让 `from core import ...` 能正确解析
+#sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from processor import (
     WaymoDataLoader,
     ScenarioRiskAnalyzer,
     ScenarioProcessor,
