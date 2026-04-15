@@ -2,29 +2,38 @@
 core/llm_intention_generator.py - LLM 意图生成器
 
 调用流程：
-1. build_trajectory_prompt() - 从 prompt_builder.py 调用轨迹提示词构造
-2. generate_intention() - 调用 LLM API 生成意图（已注释）
+1. build_trajectory_prompt() - 构造轨迹信息提示词
+2. generate_intention() - 调用 LLM API 生成意图
 
 提示词构建统一在 prompt_builder.py 中，方便后续优化。
 
 使用示例：
-    from core.llm_intention_generator import build_trajectory_prompt
+    from core.llm_intention_generator import build_trajectory_prompt, generate_intention
 
+    # Step 1: 构造轨迹提示词
     prompt = build_trajectory_prompt(fragment)
+
+    # Step 2: 生成意图
+    generator = LLMIntentionGenerator(provider="qwen", model="qwen3.6-plus")
+    intention_result = generator.generate(fragment)
 """
 
 from core.llm.prompt_builder import (
     TrajectoryPromptBuilder,
     SYSTEM_PROMPT,
-    DrivingIntention,
-    IntentionPhase,
-    IntentionSequence,
+    build_intention_query_prompt,
 )
-from core.llm.intention_models import UnifiedLLMClient
+from core.llm.intention_models import (
+    UnifiedLLMClient,
+    identify_key_frames,
+    generate_intention as call_llm_generate_intention,
+    parse_intention_response,
+    IntentionFrame,
+)
 
 import os
 import json
-
+from typing import Dict, Any
 
 
 # =============================================================================
@@ -52,7 +61,7 @@ def get_system_prompt() -> str:
 
 
 # =============================================================================
-# 意图生成器（Step 2 已注释）
+# 意图生成器
 # =============================================================================
 
 class LLMIntentionGenerator:
@@ -61,7 +70,7 @@ class LLMIntentionGenerator:
 
     使用示例：
         generator = LLMIntentionGenerator(provider="qwen", model="qwen3.6-plus")
-        intention_seq = generator.generate(fragment)
+        intention_result = generator.generate(fragment)
     """
 
     def __init__(self, provider: str = "qwen", model: str = "qwen3.6-plus", api_key: str = None):
@@ -74,32 +83,57 @@ class LLMIntentionGenerator:
         """Step 1: 构造轨迹信息提示词"""
         return self.prompt_builder.build_prompt(fragment)
 
-    def generate(self, fragment: dict) -> IntentionSequence:
-        """完整流程：Step 1 + Step 2"""
+    def generate(self, fragment: dict) -> Dict[str, Any]:
+        """
+        完整流程：Step 1 + Step 2
+
+        Args:
+            fragment: 轨迹片段数据
+
+        Returns:
+            意图分析结果，包含 intention_frames 列表和 trajectory_prompt
+        """
+        # Step 1: 轨迹提示词
         trajectory_prompt = self.build_trajectory_prompt(fragment)
 
-        print("【提示】Step 2 已注释，请测试 Step 1 确认无误后取消注释")
-        return self._default_intention_sequence(fragment, trajectory_prompt)
+        # Step 2: 计算关键帧
+        key_frames = identify_key_frames(fragment)
 
-    def _default_intention_sequence(self, fragment: dict, trajectory_prompt: str = "") -> IntentionSequence:
-        """返回默认意图序列"""
-        frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
-        frame_count = frag.get("frame_count", 50)
-
-        return IntentionSequence(
-            phases=[
-                IntentionPhase(
-                    start_frame=0,
-                    end_frame=frame_count,
-                    intention=DrivingIntention.CRUISE_MAINTAIN,
-                    confidence=0.5,
-                    reasoning="默认匀速意图"
-                )
-            ],
-            overall_strategy="默认策略",
-            raw_response="",
-            trajectory_prompt=trajectory_prompt
+        # Step 3: 构造完整询问提示词
+        full_prompt = build_intention_query_prompt(
+            trajectory_prompt, key_frames, SYSTEM_PROMPT
         )
+
+        # Step 4: 调用 LLM
+        response = call_llm_generate_intention(
+            self.client, full_prompt, self.model
+        )
+
+        # Step 5: 解析响应
+        result = parse_intention_response(response, key_frames, trajectory_prompt)
+
+        return result
+
+    def generate_with_fallback(self, fragment: dict) -> Dict[str, Any]:
+        """
+        带默认值的意图生成（LLM 失败时返回空列表）
+
+        Args:
+            fragment: 轨迹片段数据
+
+        Returns:
+            意图分析结果
+        """
+        try:
+            return self.generate(fragment)
+        except Exception as e:
+            print(f"意图生成失败: {e}")
+            trajectory_prompt = self.build_trajectory_prompt(fragment)
+            return {
+                "intention_frames": [],
+                "trajectory_prompt": trajectory_prompt,
+                "error": str(e)
+            }
 
 
 # =============================================================================
@@ -111,7 +145,7 @@ DEFAULT_INTENTION_DIR = "data/intention"
 
 def save_fragment_with_intention(
     fragment: dict,
-    intention_seq: IntentionSequence,
+    intention_result: Dict[str, Any],
     output_dir: str = DEFAULT_INTENTION_DIR,
     provider: str = "qwen",
     model: str = "qwen3.6-plus"
@@ -121,7 +155,7 @@ def save_fragment_with_intention(
 
     Args:
         fragment: 原始片段数据
-        intention_seq: 意图序列
+        intention_result: generate() 返回的意图分析结果
         output_dir: 输出目录
         provider: LLM 提供商
         model: LLM 模型
@@ -131,8 +165,9 @@ def save_fragment_with_intention(
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    meta = fragment.get("metadata", {})
+    # 获取片段信息
     frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
+    meta = fragment.get("metadata", frag.get("metadata", {}))
     scenario_id = meta.get("scenario_id", "unknown")
     ego_id = meta.get("ego_vehicle_id", "unknown")
     target_id = frag.get("target_trajectory", {}).get("vehicle_id", "unknown")
@@ -141,12 +176,33 @@ def save_fragment_with_intention(
     file_name = f"{fragment_id}_with_intention.json"
     file_path = os.path.join(output_dir, file_name)
 
+    # 构造输出数据
+    intention_frames = intention_result.get("intention_frames", [])
+
+    # 转换为可序列化格式
+    intention_frames_data = []
+    if isinstance(intention_frames, list):
+        for f in intention_frames:
+            if isinstance(f, IntentionFrame):
+                intention_frames_data.append(f.to_dict())
+            elif isinstance(f, dict):
+                intention_frames_data.append(f)
+    elif isinstance(intention_frames, list) and len(intention_frames) == 0:
+        intention_frames_data = []
+
     output_data = {
-        "original_fragment": fragment,
-        "intention_sequence": intention_seq.to_dict(),
-        "trajectory_prompt": intention_seq.trajectory_prompt,
-        "provider": provider,
-        "model": model,
+        "fragment_id": fragment_id,
+        "metadata": meta,
+        "ego_trajectory": frag.get("ego_trajectory", {}),
+        "target_trajectory": frag.get("target_trajectory", {}),
+        "interaction_features": frag.get("interaction_features", {}),
+        "interaction_stats": frag.get("interaction_stats", {}),
+        "intention_analysis": {
+            "provider": provider,
+            "model": model,
+            "intention_frames": intention_frames_data,
+            "trajectory_prompt": intention_result.get("trajectory_prompt", ""),
+        }
     }
 
     with open(file_path, 'w', encoding='utf-8') as f:

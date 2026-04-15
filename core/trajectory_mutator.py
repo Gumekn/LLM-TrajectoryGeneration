@@ -1,507 +1,591 @@
 """
-core/trajectory_mutator.py - 基于意图的轨迹变异器
+core/trajectory_mutator.py - 意图驱动轨迹变异器（穷举版本）
 
-根据 LLM 生成的驾驶意图序列，对轨迹进行变异。
-变异通过以下步骤：
-1. 意图序列 → 关键帧变异参数
-2. 三次样条插值得到全帧参数
-3. 运动学积分计算 x, y 坐标
+职责：
+基于驾驶意图的穷举变异，生成所有有效的轨迹变体
+
+变异变量：
+    Delta_a: 纵向加速度增量 (m/s^2)，颗粒度 0.1
+    Delta_omega: 横摆角速度增量 (rad/s)，颗粒度 0.0087 (0.5度/s)
+
+运动学状态向量：
+    S_t = [v_t, a_t, theta_t, omega_t, x_t, y_t]
+
+状态更新公式：
+    a_t = clamp(a_{t-1} + Delta_a, -8.0, 3.0)
+    omega_t = clamp(omega_{t-1} + Delta_omega, -0.349, 0.349)  # rad/s
+    v_t = max(0, v_{t-1} + a_t * dt)
+    theta_t = theta_{t-1} + omega_t * dt
+    x_t = x_{t-1} + v_t * cos(theta_t) * dt
+    y_t = y_{t-1} + v_t * sin(theta_t) * dt
+
+使用示例：
+    from core.trajectory_mutator import IntentionDrivenTrajectoryMutator
+
+    mutator = IntentionDrivenTrajectoryMutator()
+    variants = mutator.mutate(fragment)
 """
 
 import math
-import json
-from typing import Dict, List, Optional, Any
+import itertools
+from typing import Dict, List, Optional, Any, Iterator, Tuple
 
 import numpy as np
-from scipy.interpolate import CubicSpline
 
 from core.llm.prompt_builder import (
     IntentionSequence,
     IntentionPhase,
     DrivingIntention,
-    MutationParams,
 )
 
 
-# 意图参数模板
-# 每个意图定义关键帧的运动学参数曲线
-INTENTION_TEMPLATES = {
-    DrivingIntention.CRUISE_MAINTAIN: {
-        "speed_scale": {"type": "constant", "value": 1.0, "noise": 0.05},
-        "accel_long": {"type": "zero", "noise": 0.1},
-        "accel_lat": {"type": "zero", "noise": 0.05},
-        "heading_rate": 0.0,
-    },
+# =============================================================================
+# 物理常数与边界约束
+# =============================================================================
 
-    DrivingIntention.DECELERATE_TO_YIELD: {
-        "speed_scale": {
-            "type": "exponential_decay",
-            "initial": 1.0,
-            "final_range": [0.3, 0.6],
-            "decay_rate_range": [0.2, 0.5],
-        },
-        "accel_long": {"type": "constant", "range": [-3.0, -1.5]},
-        "accel_lat": {"type": "zero"},
-        "heading_rate": 0.0,
-    },
+DT = 0.1  # 时间步长，10Hz
 
-    DrivingIntention.DECELERATE_TO_STOP: {
-        "speed_scale": {
-            "type": "linear_decay",
-            "initial": 1.0,
-            "final": 0.0,
-        },
-        "accel_long": {"type": "constant", "range": [-4.0, -2.0]},
-        "accel_lat": {"type": "zero"},
-        "heading_rate": 0.0,
-    },
+# 纵向加速度边界 (m/s^2)
+A_MIN = -8.0
+A_MAX = 3.0
 
-    DrivingIntention.ACCELERATE_THROUGH: {
-        "speed_scale": {
-            "type": "sigmoid_growth",
-            "initial_range": [0.7, 0.9],
-            "final_range": [1.2, 1.5],
-        },
-        "accel_long": {"type": "bell_curve", "peak_range": [2.0, 4.0], "timing": 0.3},
-        "accel_lat": {"type": "zero"},
-        "heading_rate": 0.0,
-    },
+# 横摆角速度边界 (rad/s)
+# 20 deg/s = 20 * pi / 180 rad
+OMEGA_MIN = -20 * math.pi / 180  # -0.349 rad/s
+OMEGA_MAX = 20 * math.pi / 180   # 0.349 rad/s
 
-    DrivingIntention.EMERGENCY_BRAKE: {
-        "speed_scale": {
-            "type": "sharp_decay",
-            "initial": 1.0,
-            "final": 0.0,
-        },
-        "accel_long": {"type": "constant", "range": [-8.0, -5.0]},
-        "accel_lat": {"type": "zero"},
-        "heading_rate": 0.0,
-    },
 
-    DrivingIntention.LANE_CHANGE_LEFT: {
-        "speed_scale": {"type": "slight_increase", "scale_range": [1.0, 1.2]},
-        "accel_long": {"type": "small_positive"},
-        "accel_lat": {"type": "bell_curve", "peak_range": [1.0, 2.0], "timing": 0.5},
-        "heading_rate": {"type": "bell_curve", "peak_range": [0.05, 0.15], "timing": 0.4},
-        "lateral_offset": {"type": "ramp", "start": 0.0, "end_range": [2.0, 3.5]},
-    },
+# =============================================================================
+# 变异变量离散值定义
+# =============================================================================
 
-    DrivingIntention.LANE_CHANGE_RIGHT: {
-        "speed_scale": {"type": "slight_increase", "scale_range": [1.0, 1.2]},
-        "accel_long": {"type": "small_positive"},
-        "accel_lat": {"type": "bell_curve", "peak_range": [-2.0, -1.0], "timing": 0.5},
-        "heading_rate": {"type": "bell_curve", "peak_range": [-0.15, -0.05], "timing": 0.4},
-        "lateral_offset": {"type": "ramp", "start": 0.0, "end_range": [-3.5, -2.0]},
-    },
+# Delta_a: 纵向加速度增量 (m/s^2)
+# 变异全集: -0.5, -0.2, -0.1, 0, 0.1, 0.2
+DELTA_A_VALUES = [-0.5, -0.2, -0.1, 0.0, 0.1, 0.2]
 
-    DrivingIntention.TURN_LEFT: {
-        "speed_scale": {"type": "constant", "value": 0.8, "noise": 0.05},
-        "accel_long": {"type": "small_negative"},
-        "accel_lat": {"type": "constant", "range": [1.0, 2.0]},
-        "heading_rate": {"type": "constant", "range": [0.1, 0.2]},
-    },
+# Delta_omega: 横摆角速度增量 (rad/s)
+# 变异全集: -1.0, -0.5, 0, 0.5, 1.0 deg/s
+# 转换为弧度: -0.01745, -0.00873, 0, 0.00873, 0.01745 rad
+DELTA_OMEGA_DEG = [-1.0, -0.5, 0.0, 0.5, 1.0]  # deg/s
+DELTA_OMEGA_VALUES = [d * math.pi / 180 for d in DELTA_OMEGA_DEG]  # rad/s
 
-    DrivingIntention.TURN_RIGHT: {
-        "speed_scale": {"type": "constant", "value": 0.8, "noise": 0.05},
-        "accel_long": {"type": "small_negative"},
-        "accel_lat": {"type": "constant", "range": [-2.0, -1.0]},
-        "heading_rate": {"type": "constant", "range": [-0.2, -0.1]},
-    },
 
-    DrivingIntention.GO_STRAIGHT: {
-        "speed_scale": {"type": "constant", "value": 1.0, "noise": 0.05},
-        "accel_long": {"type": "zero", "noise": 0.1},
-        "accel_lat": {"type": "zero"},
-        "heading_rate": 0.0,
-    },
+# =============================================================================
+# 意图剪枝规则
+# =============================================================================
 
-    DrivingIntention.UNKNOWN: {
-        "speed_scale": {"type": "constant", "value": 1.0, "noise": 0.1},
-        "accel_long": {"type": "zero", "noise": 0.2},
-        "accel_lat": {"type": "zero", "noise": 0.1},
-        "heading_rate": 0.0,
-    },
+class IntentionPruningRules:
+    """
+    意图剪枝规则 - 定义每个意图类型的有效变异组合
+
+    属性：
+        delta_a_values: 有效的 Delta_a 列表
+        delta_omega_values: 有效的 Delta_omega 列表
+        special_stop: 是否需要停车特判
+        lock_steering: 是否锁死方向盘
+    """
+
+    def __init__(
+        self,
+        delta_a_values: List[float],
+        delta_omega_values: List[float],
+        special_stop: bool = False,
+        lock_steering: bool = False,
+    ):
+        self.delta_a_values = delta_a_values
+        self.delta_omega_values = delta_omega_values
+        self.special_stop = special_stop
+        self.lock_steering = lock_steering
+
+    def generate_combinations(self) -> Iterator[Tuple[float, float]]:
+        """
+        生成该意图的所有有效变异组合
+
+        穷举所有 Delta_a 和 Delta_omega 的笛卡尔积
+        """
+        for da in self.delta_a_values:
+            for dw in self.delta_omega_values:
+                yield (da, dw)
+
+
+# 各意图的剪枝规则
+INTENTION_PRUNING: Dict[DrivingIntention, IntentionPruningRules] = {
+    # 类别1：纯纵向意图（限制 Delta_omega 约等于 0）
+
+    DrivingIntention.CRUISE_MAINTAIN: IntentionPruningRules(
+        delta_a_values=[-0.1, 0.0, 0.1],  # 趋零收敛
+        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
+    ),
+
+    DrivingIntention.ACCELERATE_THROUGH: IntentionPruningRules(
+        delta_a_values=[0.0, 0.1, 0.2],  # 强制非负
+        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
+    ),
+
+    DrivingIntention.DECELERATE_TO_YIELD: IntentionPruningRules(
+        delta_a_values=[-0.2, -0.1, 0.0],  # 平缓减速
+        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
+    ),
+
+    DrivingIntention.DECELERATE_TO_STOP: IntentionPruningRules(
+        delta_a_values=[-0.2, -0.1, 0.0],  # 减速
+        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
+        special_stop=True,  # 需要停车特判
+    ),
+
+    DrivingIntention.EMERGENCY_BRAKE: IntentionPruningRules(
+        delta_a_values=[-0.5, -0.2],  # 强制深度减速
+        delta_omega_values=[0.0],  # 锁死方向盘
+        lock_steering=True,
+    ),
+
+    # 类别2：横向/综合意图
+
+    DrivingIntention.LANE_CHANGE_LEFT: IntentionPruningRules(
+        delta_a_values=[-0.1, 0.0, 0.1],
+        delta_omega_values=DELTA_OMEGA_VALUES[2:5],  # 0, 0.5, 1.0 deg/s
+    ),
+
+    DrivingIntention.LANE_CHANGE_RIGHT: IntentionPruningRules(
+        delta_a_values=[-0.1, 0.0, 0.1],
+        delta_omega_values=DELTA_OMEGA_VALUES[0:3],  # -1.0, -0.5, 0 deg/s
+    ),
+
+    DrivingIntention.TURN_LEFT: IntentionPruningRules(
+        delta_a_values=[-0.2, -0.1, 0.0, 0.1],  # 允许入弯降速
+        delta_omega_values=DELTA_OMEGA_VALUES[3:5],  # 0.5, 1.0 deg/s
+    ),
+
+    DrivingIntention.TURN_RIGHT: IntentionPruningRules(
+        delta_a_values=[-0.2, -0.1, 0.0, 0.1],
+        delta_omega_values=DELTA_OMEGA_VALUES[0:2],  # -1.0, -0.5 deg/s
+    ),
+
+    DrivingIntention.GO_STRAIGHT: IntentionPruningRules(
+        delta_a_values=[-0.2, -0.1, 0.0, 0.1, 0.2],  # 自由跟车
+        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
+    ),
+
+    DrivingIntention.UNKNOWN: IntentionPruningRules(
+        delta_a_values=[-0.1, 0.0, 0.1],
+        delta_omega_values=[0.0],
+    ),
 }
 
 
-def _compute_speed(velocity: List[float]) -> float:
-    """计算速度标量"""
-    return math.sqrt(velocity[0]**2 + velocity[1]**2) if velocity else 0
+# =============================================================================
+# 运动学计算函数
+# =============================================================================
 
+def clamp(value: float, min_val: float, max_val: float) -> float:
+    """将值限制在 [min_val, max_val] 范围内"""
+    return max(min_val, min(max_val, value))
+
+
+def compute_speed_from_velocity(velocity: List[float]) -> float:
+    """从速度向量计算速度标量"""
+    if not velocity:
+        return 0.0
+    return math.sqrt(velocity[0]**2 + velocity[1]**2)
+
+
+def compute_initial_state(trajectory: Dict) -> Dict:
+    """
+    从原始轨迹数据计算初始状态
+
+    参数：
+        trajectory: VehicleTrajectory 结构，包含 positions, headings, velocities, accelerations
+
+    返回：
+        初始状态字典 {v, a, theta, omega, x, y}
+    """
+    velocities = trajectory.get("velocities", [[0.0, 0.0]])
+    headings = trajectory.get("headings", [0.0])
+    positions = trajectory.get("positions", [[0.0, 0.0, 0.0]])
+
+    # 速度标量
+    v = compute_speed_from_velocity(velocities[0]) if velocities else 0.0
+
+    # 纵向加速度（取局部坐标系X分量）
+    a = velocities[0][0] if velocities else 0.0  # 默认用速度近似
+
+    # 航向角
+    theta = headings[0] if headings else 0.0
+
+    # 横摆角速度：通过相邻帧航向差分计算
+    if len(headings) >= 2:
+        omega = (headings[1] - headings[0]) / DT
+    else:
+        omega = 0.0
+
+    # 位置
+    x = positions[0][0] if positions else 0.0
+    y = positions[0][1] if positions else 0.0
+
+    return {
+        "v": v,
+        "a": a,
+        "theta": theta,
+        "omega": omega,
+        "x": x,
+        "y": y,
+    }
+
+
+def integrate_state(
+    state: Dict,
+    delta_a: float,
+    delta_omega: float,
+    dt: float = DT
+) -> Dict:
+    """
+    运动学状态积分 - 根据变异量计算下一帧状态
+
+    公式：
+        a_t = clamp(a_{t-1} + Delta_a, -8.0, 3.0)
+        omega_t = clamp(omega_{t-1} + Delta_omega, -0.349, 0.349)
+        v_t = max(0, v_{t-1} + a_t * dt)
+        theta_t = theta_{t-1} + omega_t * dt
+        x_t = x_{t-1} + v_t * cos(theta_t) * dt
+        y_t = y_{t-1} + v_t * sin(theta_t) * dt
+
+    参数：
+        state: 当前状态字典 {v, a, theta, omega, x, y}
+        delta_a: 纵向加速度增量 (m/s^2)
+        delta_omega: 横摆角速度增量 (rad/s)
+        dt: 时间步长
+
+    返回：
+        下一帧状态字典
+    """
+    v_prev = state["v"]
+    a_prev = state["a"]
+    theta_prev = state["theta"]
+    omega_prev = state["omega"]
+    x_prev = state["x"]
+    y_prev = state["y"]
+
+    # 加速度更新
+    a = clamp(a_prev + delta_a, A_MIN, A_MAX)
+
+    # 横摆角速度更新
+    omega = clamp(omega_prev + delta_omega, OMEGA_MIN, OMEGA_MAX)
+
+    # 速度更新（确保非负）
+    v = max(0.0, v_prev + a * dt)
+
+    # 航向角更新
+    theta = theta_prev + omega * dt
+
+    # 位置更新
+    x = x_prev + v * math.cos(theta) * dt
+    y = y_prev + v * math.sin(theta) * dt
+
+    return {
+        "v": v,
+        "a": a,
+        "theta": theta,
+        "omega": omega,
+        "x": x,
+        "y": y,
+    }
+
+
+# =============================================================================
+# 轨迹变异器
+# =============================================================================
 
 class IntentionDrivenTrajectoryMutator:
-    """基于 LLM 意图的轨迹变异器"""
+    """
+    意图驱动轨迹变异器（穷举版本）
 
-    def __init__(self, intention_generator=None, seed: Optional[int] = None):
+    根据意图序列穷举生成所有有效的轨迹变体
+
+    使用示例：
+        mutator = IntentionDrivenTrajectoryMutator()
+        variants = mutator.mutate(fragment)
+    """
+
+    def mutate(self, fragment: Dict) -> List[Dict]:
         """
-        初始化变异器
+        穷举生成所有轨迹变体
 
-        Args:
-            intention_generator: LLM 意图生成器，如果为 None 则使用随机意图
-            seed: 随机种子，用于可重现性
+        参数：
+            fragment: 原始轨迹片段数据（包含意图序列和轨迹）
+
+        返回：
+            所有变体轨迹列表
         """
-        self.intention_generator = intention_generator
-        if seed is not None:
-            np.random.seed(seed)
-
-    def mutate(self, fragment: Dict, n_variants: int = 10) -> List[Dict]:
-        """
-        生成变异轨迹
-
-        Args:
-            fragment: 原始轨迹片段（来自 JSON）
-            n_variants: 生成的变体数量
-
-        Returns:
-            变异后的轨迹列表，每个元素包含:
-                - original_fragment_id: 原始片段ID
-                - intention_sequence: 意图序列
-                - trajectory: 变异后的轨迹数据
-                - variant_id: 变体编号
-        """
-        # 1. 生成意图序列
-        if self.intention_generator:
-            intention_seq = self.intention_generator.generate(fragment)
-        else:
-            # 随机生成意图序列
-            intention_seq = self._generate_random_intention_sequence(fragment)
-
-        # 2. 为每个变体生成变异参数
-        variants = []
-        for i in range(n_variants):
-            variant = self._generate_variant(fragment, intention_seq, variant_id=i)
-            variants.append(variant)
-
-        return variants
-
-    def _generate_random_intention_sequence(self, fragment: Dict) -> IntentionSequence:
-        """生成随机意图序列（当无 LLM 时使用）"""
-        meta = fragment.get("metadata", {})
+        # 解析片段数据
         frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
+        target = frag.get("target_trajectory", {})
         frame_count = frag.get("frame_count", 50)
 
-        # 随机选择意图
-        intentions = [
-            DrivingIntention.CRUISE_MAINTAIN,
-            DrivingIntention.DECELERATE_TO_YIELD,
-            DrivingIntention.ACCELERATE_THROUGH,
-        ]
-        intention = np.random.choice(intentions)
+        # 获取意图序列
+        intention_seq = self._build_intention_sequence(frag)
 
+        # 收集每个意图段的变异组合
+        segment_combinations = []
+        for phase in intention_seq.phases:
+            rules = INTENTION_PRUNING.get(
+                phase.intention,
+                INTENTION_PRUNING[DrivingIntention.UNKNOWN]
+            )
+            combos = list(rules.generate_combinations())
+            segment_combinations.append({
+                "phase": phase,
+                "combinations": combos,
+                "rules": rules,
+            })
+
+        # 计算总变体数
+        total_variants = 1
+        for seg in segment_combinations:
+            total_variants *= len(seg["combinations"])
+
+        print(f"意图段数量: {len(segment_combinations)}")
+        print(f"各段组合数: {[len(seg['combinations']) for seg in segment_combinations]}")
+        print(f"总变体数量: {total_variants}")
+
+        # 穷举生成所有变体
+        variants = []
+        variant_id = 0
+
+        # 递归穷举所有段的组合
+        for combo_tuple in self._enumerate_combinations(segment_combinations, 0, []):
+            variant = self._generate_trajectory(
+                target, intention_seq, combo_tuple, variant_id, frame_count
+            )
+            variants.append(variant)
+            variant_id += 1
+
+            if variant_id % 1000 == 0:
+                print(f"已生成 {variant_id}/{total_variants} 个变体...")
+
+        print(f"完成！共生成 {len(variants)} 个变体")
+        return variants
+
+    def _build_intention_sequence(self, frag: Dict) -> IntentionSequence:
+        """
+        构建意图序列
+
+        如果片段中包含意图数据，使用片段中的意图
+        否则使用默认的单一意图段
+        """
+        # 检查是否有意图分析结果
+        intention_analysis = frag.get("intention_analysis", {})
+
+        if intention_analysis and "intention_frames" in intention_analysis:
+            # 从意图帧构建意图序列
+            frames = intention_analysis["intention_frames"]
+            if frames:
+                # 使用第一个意图帧的意图作为整个轨迹的意图
+                first_intention = frames[0].get("intention", "cruise_maintain")
+                try:
+                    intention = DrivingIntention(first_intention)
+                except ValueError:
+                    intention = DrivingIntention.CRUISE_MAINTAIN
+
+                return IntentionSequence(
+                    phases=[
+                        IntentionPhase(
+                            start_frame=0,
+                            end_frame=frag.get("frame_count", 50),
+                            intention=intention,
+                            reasoning="从意图帧推断"
+                        )
+                    ],
+                    overall_strategy="意图驱动"
+                )
+
+        # 默认意图序列
+        frame_count = frag.get("frame_count", 50)
         return IntentionSequence(
             phases=[
                 IntentionPhase(
                     start_frame=0,
                     end_frame=frame_count,
-                    intention=intention,
-                    confidence=0.8,
-                    reasoning="随机生成"
+                    intention=DrivingIntention.CRUISE_MAINTAIN,
+                    reasoning="默认意图"
                 )
             ],
             overall_strategy="默认策略"
         )
 
-    def _generate_variant(
+    def _enumerate_combinations(
         self,
-        fragment: Dict,
-        intention_seq: IntentionSequence,
-        variant_id: int
-    ) -> Dict:
-        """生成单条变异轨迹"""
-        np.random.seed(variant_id)
+        segments: List[Dict],
+        idx: int,
+        current: List[Tuple[float, float]]
+    ) -> Iterator[List[Tuple[float, float]]]:
+        """
+        递归穷举所有意图段的参数组合
 
-        meta = fragment.get("metadata", {})
-        frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
-        target = frag.get("target_trajectory", {})
+        参数：
+            segments: 意图段列表
+            idx: 当前处理的段索引
+            current: 当前累积的组合列表
 
-        frame_count = frag.get("frame_count", 50)
-        dt = 0.1  # 10Hz
+        返回：
+            完整组合列表的迭代器
+        """
+        if idx >= len(segments):
+            yield current.copy()
+            return
 
-        # 1. 生成关键帧参数
-        key_frames, key_params = self._generate_key_params(
-            intention_seq, frame_count, variant_id
-        )
+        for combo in segments[idx]["combinations"]:
+            current.append(combo)
+            yield from self._enumerate_combinations(segments, idx + 1, current)
+            current.pop()
 
-        # 2. 插值得到全帧参数
-        indicators = self._interpolate_params(key_frames, key_params, frame_count)
-
-        # 3. 运动学积分
-        trajectory = self._integrate_trajectory(target, indicators, dt)
-
-        return {
-            "original_fragment_id": frag.get("fragment_id", "unknown"),
-            "intention_sequence": intention_seq.to_dict(),
-            "trajectory": trajectory,
-            "variant_id": variant_id
-        }
-
-    def _generate_key_params(
+    def _generate_trajectory(
         self,
+        target: Dict,
         intention_seq: IntentionSequence,
+        combo_list: List[Tuple[float, float]],
+        variant_id: int,
         frame_count: int,
-        variant_id: int
-    ) -> tuple:
-        """为每个意图阶段生成关键帧参数"""
-        key_frames = set()
-        key_params = {
-            "speed_scale": [],
-            "accel_long": [],
-            "accel_lat": [],
-            "heading_rate": [],
-            "lateral_offset": []
-        }
+    ) -> Dict:
+        """
+        根据变异组合生成一条轨迹
 
-        for phase in intention_seq.phases:
-            template = INTENTION_TEMPLATES.get(
-                phase.intention,
-                INTENTION_TEMPLATES[DrivingIntention.CRUISE_MAINTAIN]
+        参数：
+            target: 原始轨迹数据
+            intention_seq: 意图序列
+            combo_list: 各意图段对应的 (Delta_a, Delta_omega) 组合列表
+            variant_id: 变体编号
+            frame_count: 总帧数
+
+        返回：
+            变体字典
+        """
+        # 计算初始状态
+        state = compute_initial_state(target)
+
+        # 初始化输出数组
+        positions = np.zeros((frame_count, 3))
+        headings = np.zeros(frame_count)
+        velocities = np.zeros((frame_count, 2))
+        accelerations = np.zeros((frame_count, 2))
+
+        # 特殊处理：停车标志
+        stopped = False
+
+        # 获取每个意图段对应的组合索引
+        combo_idx = 0
+
+        for t in range(frame_count):
+            # 存储当前状态
+            positions[t] = [state["x"], state["y"], target.get("positions", [[0, 0, 0]])[0][2]]
+            headings[t] = state["theta"]
+            velocities[t] = [state["v"], 0.0]  # 局部坐标系：纵向速度 v，横向 0
+            accelerations[t] = [state["a"], state["v"] * state["omega"]]  # 纵向加速度，向心加速度
+
+            # 确定当前帧对应的变异组合
+            delta_a, delta_omega = self._get_combo_for_frame(
+                intention_seq, combo_list, t, combo_idx
             )
 
-            # 添加关键帧
-            key_frames.add(phase.start_frame)
-            key_frames.add(phase.end_frame)
+            # 更新组合索引
+            for i, phase in enumerate(intention_seq.phases):
+                if t == phase.start_frame and i > combo_idx:
+                    combo_idx = i
 
-            # 从模板采样参数
-            phase_params = self._sample_from_template(template, phase, variant_id)
-
-            key_params["speed_scale"].append(phase_params["speed_scale"])
-            key_params["accel_long"].append(phase_params["accel_long"])
-            key_params["accel_lat"].append(phase_params["accel_lat"])
-            key_params["heading_rate"].append(phase_params["heading_rate"])
-            key_params["lateral_offset"].append(phase_params.get("lateral_offset", 0.0))
-
-        # 去重并排序
-        key_frames = sorted(key_frames)
-
-        # 确保关键帧参数与关键帧数量匹配
-        for key in key_params:
-            while len(key_params[key]) < len(key_frames):
-                key_params[key].append(key_params[key][-1] if key_params[key] else 0.0)
-
-        return key_frames, key_params
-
-    def _sample_from_template(
-        self,
-        template: Dict,
-        phase: IntentionPhase,
-        variant_id: int
-    ) -> Dict:
-        """从意图模板采样参数"""
-        result = {}
-
-        # speed_scale
-        speed_cfg = template.get("speed_scale", {})
-        speed_type = speed_cfg.get("type", "constant")
-
-        if speed_type == "constant":
-            value = speed_cfg.get("value", 1.0)
-            noise = speed_cfg.get("noise", 0)
-            result["speed_scale"] = value * (1 + np.random.uniform(-noise, noise))
-        elif speed_type == "exponential_decay":
-            initial = speed_cfg.get("initial", 1.0)
-            final_range = speed_cfg.get("final_range", [0.3, 0.6])
-            final = np.random.uniform(*final_range)
-            result["speed_scale"] = [initial, final]
-        elif speed_type == "sigmoid_growth":
-            initial_range = speed_cfg.get("initial_range", [0.7, 0.9])
-            final_range = speed_cfg.get("final_range", [1.2, 1.5])
-            initial = np.random.uniform(*initial_range)
-            final = np.random.uniform(*final_range)
-            result["speed_scale"] = [initial, final]
-        elif speed_type == "linear_decay" or speed_type == "sharp_decay":
-            initial = speed_cfg.get("initial", 1.0)
-            final = speed_cfg.get("final", 0.0)
-            result["speed_scale"] = [initial, final]
-        elif speed_type == "slight_increase":
-            scale_range = speed_cfg.get("scale_range", [1.0, 1.2])
-            scale = np.random.uniform(*scale_range)
-            result["speed_scale"] = [1.0, scale]
-        else:
-            result["speed_scale"] = 1.0
-
-        # accel_long
-        accel_cfg = template.get("accel_long", {})
-        accel_type = accel_cfg.get("type", "zero")
-
-        if accel_type == "zero":
-            noise = accel_cfg.get("noise", 0.1)
-            result["accel_long"] = np.random.uniform(-noise, noise)
-        elif accel_type == "constant":
-            range_vals = accel_cfg.get("range", [-3.0, -1.5])
-            result["accel_long"] = np.random.uniform(*range_vals)
-        elif accel_type == "small_positive":
-            result["accel_long"] = np.random.uniform(0.5, 1.5)
-        elif accel_type == "small_negative":
-            result["accel_long"] = np.random.uniform(-1.5, -0.5)
-        else:
-            result["accel_long"] = 0.0
-
-        # accel_lat
-        lat_cfg = template.get("accel_lat", {})
-        lat_type = lat_cfg.get("type", "zero")
-
-        if lat_type == "zero":
-            noise = lat_cfg.get("noise", 0.05)
-            result["accel_lat"] = np.random.uniform(-noise, noise)
-        elif lat_type == "constant":
-            range_vals = lat_cfg.get("range", [1.0, 2.0])
-            result["accel_lat"] = np.random.uniform(*range_vals)
-        elif lat_type == "bell_curve":
-            # 钟形曲线参数在插值时处理，这里只返回峰值
-            peak_range = lat_cfg.get("peak_range", [1.0, 2.0])
-            result["accel_lat"] = np.random.uniform(*peak_range)
-        else:
-            result["accel_lat"] = 0.0
-
-        # heading_rate
-        hr = template.get("heading_rate", 0)
-        if isinstance(hr, dict):
-            if hr.get("type") == "bell_curve":
-                peak_range = hr.get("peak_range", [0.05, 0.15])
-                result["heading_rate"] = np.random.uniform(*peak_range)
+            # 特殊判断：停车
+            if stopped:
+                state = {
+                    "v": 0.0,
+                    "a": 0.0,
+                    "theta": state["theta"],
+                    "omega": 0.0,
+                    "x": state["x"],
+                    "y": state["y"],
+                }
             else:
-                range_vals = hr.get("range", [0.1, 0.2])
-                result["heading_rate"] = np.random.uniform(*range_vals)
-        elif isinstance(hr, (int, float)):
-            result["heading_rate"] = hr * (1 + np.random.uniform(-0.1, 0.1))
-        else:
-            result["heading_rate"] = 0.0
+                # 运动学积分
+                state = integrate_state(state, delta_a, delta_omega)
 
-        # lateral_offset
-        if "lateral_offset" in template:
-            lo_cfg = template["lateral_offset"]
-            if lo_cfg.get("type") == "ramp":
-                start = lo_cfg.get("start", 0.0)
-                end_range = lo_cfg.get("end_range", [2.0, 3.5])
-                end = np.random.uniform(*end_range)
-                result["lateral_offset"] = [start, end]
-            else:
-                result["lateral_offset"] = [0.0, 0.0]
-        else:
-            result["lateral_offset"] = 0.0
-
-        return result
-
-    def _interpolate_params(
-        self,
-        key_frames: List[int],
-        key_params: Dict,
-        frame_count: int
-    ) -> Dict:
-        """三次样条插值"""
-        if len(key_frames) < 2:
-            # 常数值
-            return {
-                key: np.full(frame_count, val[0] if isinstance(val, list) else val)
-                for key, val in key_params.items()
-            }
-
-        t_key = np.array(key_frames)
-        t_full = np.arange(frame_count)
-
-        result = {}
-        for param_key, values in key_params.items():
-            # 处理特殊格式 [start, end]
-            processed_values = []
-            for v in values:
-                if isinstance(v, list):
-                    processed_values.append(v[0])  # 取起始值
-                else:
-                    processed_values.append(v)
-
-            if len(processed_values) < len(key_frames):
-                processed_values.extend([processed_values[-1]] * (len(key_frames) - len(processed_values)))
-
-            try:
-                cs = CubicSpline(t_key, processed_values)
-                result[param_key] = cs(t_full)
-            except Exception:
-                result[param_key] = np.full(frame_count, processed_values[0] if processed_values else 0.0)
-
-        return result
-
-    def _integrate_trajectory(
-        self,
-        original_trajectory: Dict,
-        indicators: Dict,
-        dt: float
-    ) -> Dict:
-        """运动学积分"""
-        frame_count = len(indicators["speed_scale"])
-
-        # 初始状态
-        velocities = original_trajectory.get("velocities", [[0, 0]])
-        headings = original_trajectory.get("headings", [0])
-        positions = original_trajectory.get("positions", [[0, 0, 0]])
-
-        initial_speed = _compute_speed(velocities[0]) if velocities else 0
-        initial_heading = headings[0] if headings else 0
-        initial_pos = positions[0] if positions else [0, 0, 0]
-
-        # 积分
-        new_positions = np.zeros((frame_count, 3))
-        new_headings = np.zeros(frame_count)
-        new_velocities = np.zeros((frame_count, 2))
-        new_valid = [True] * frame_count
-
-        new_positions[0] = initial_pos
-        new_headings[0] = initial_heading
-
-        for t in range(frame_count - 1):
-            # 当前状态
-            speed_scale = indicators["speed_scale"][t]
-            v = initial_speed * speed_scale
-
-            h = new_headings[t]
-
-            # 加速度（全局坐标系）
-            a_long = indicators["accel_long"][t]
-            a_lat = indicators["accel_lat"][t]
-
-            # 积分速度（考虑加速度）
-            v_next = v + a_long * dt
-            v_next = max(v_next, 0)  # 速度非负
-
-            # 积分航向
-            h_rate = indicators["heading_rate"][t]
-            h_next = h + h_rate * dt
-
-            # 积分位置
-            x_next = new_positions[t, 0] + v * math.cos(h) * dt
-            y_next = new_positions[t, 1] + v * math.sin(h) * dt
-
-            new_positions[t + 1] = [x_next, y_next, new_positions[t, 2]]
-            new_headings[t + 1] = h_next
-            new_velocities[t] = [v * math.cos(h), v * math.sin(h)]
+                # 检查是否需要停车特判
+                if self._should_stop(state, intention_seq, t):
+                    stopped = True
 
         return {
-            "positions": new_positions.tolist(),
-            "headings": new_headings.tolist(),
-            "velocities": new_velocities.tolist(),
-            "valid": new_valid
+            "original_fragment_id": target.get("fragment_id", "unknown"),
+            "intention_sequence": intention_seq.to_dict(),
+            "variant_id": variant_id,
+            "params": [
+                {"phase": phase.start_frame, "delta_a": combo[0], "delta_omega": combo[1]}
+                for phase, combo in zip(intention_seq.phases, combo_list)
+            ],
+            "trajectory": {
+                "positions": positions.tolist(),
+                "headings": headings.tolist(),
+                "velocities": velocities.tolist(),
+                "accelerations": accelerations.tolist(),
+                "valid": [True] * frame_count,
+            }
         }
 
+    def _get_combo_for_frame(
+        self,
+        intention_seq: IntentionSequence,
+        combo_list: List[Tuple[float, float]],
+        frame: int,
+        current_idx: int
+    ) -> Tuple[float, float]:
+        """获取指定帧对应的变异组合"""
+        for i, phase in enumerate(intention_seq.phases):
+            if phase.start_frame <= frame < phase.end_frame:
+                if i < len(combo_list):
+                    return combo_list[i]
+                else:
+                    return (0.0, 0.0)
+        return (0.0, 0.0)
 
-def mutate_trajectories(
-    fragment: Dict,
-    n_variants: int = 10,
-    model_name: str = "qwen-plus",
-    seed: Optional[int] = None
-) -> List[Dict]:
+    def _should_stop(
+        self,
+        state: Dict,
+        intention_seq: IntentionSequence,
+        frame: int
+    ) -> bool:
+        """判断是否应该停车"""
+        for phase in intention_seq.phases:
+            if phase.start_frame <= frame < phase.end_frame:
+                rules = INTENTION_PRUNING.get(
+                    phase.intention,
+                    INTENTIONPruningRules([-0.1, 0.0, 0.1], [0.0])
+                )
+                # decelerate_to_stop 特判：速度为0时强制停车
+                if rules.special_stop and state["v"] <= 0.01:
+                    return True
+        return False
+
+
+def mutate_trajectories(fragment: Dict) -> List[Dict]:
     """
-    便捷函数：变异轨迹
+    便捷函数：穷举生成所有轨迹变体
 
-    Args:
+    参数：
         fragment: 原始轨迹片段
-        n_variants: 变体数量
-        model_name: LLM 模型名称
-        seed: 随机种子
 
-    Returns:
-        变异后的轨迹列表
+    返回：
+        所有变异后的轨迹列表
     """
-    from core.llm_intention_generator import LLMIntentionGenerator
+    mutator = IntentionDrivenTrajectoryMutator()
+    return mutator.mutate(fragment)
 
-    generator = LLMIntentionGenerator(model_name)
-    mutator = IntentionDrivenTrajectoryMutator(generator, seed=seed)
-    return mutator.mutate(fragment, n_variants)
+
+def get_combination_count(intention: DrivingIntention) -> int:
+    """
+    获取指定意图类型的有效组合数
+
+    参数：
+        intention: 驾驶意图类型
+
+    返回：
+        有效变异组合数量
+    """
+    rules = INTENTION_PRUNING.get(intention)
+    if rules is None:
+        return 0
+    return len(list(rules.generate_combinations()))

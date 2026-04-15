@@ -52,16 +52,18 @@ from .processor import (
     compute_max_curvature,
 )
 
-# 轨迹提示词构造
+# 轨迹提示词构造和意图生成
 from .llm_intention_generator import (
     build_trajectory_prompt,
+    LLMIntentionGenerator,
+    save_fragment_with_intention,
 )
 
 # 轨迹变异
 from .trajectory_mutator import (
     IntentionDrivenTrajectoryMutator,
     mutate_trajectories,
-    INTENTION_TEMPLATES,
+    get_combination_count,
 )
 
 # LLM 统一客户端和提示词构造
@@ -69,11 +71,14 @@ from .llm import (
     UnifiedLLMClient,
     list_providers,
     DrivingIntention,
-    MutationParams,
     IntentionPhase,
     IntentionSequence,
     TrajectoryPromptBuilder,
     SYSTEM_PROMPT,
+    identify_key_frames,
+    generate_intention,
+    parse_intention_response,
+    IntentionFrame,
 )
 
 __all__ = [
@@ -104,11 +109,13 @@ __all__ = [
 
     # 轨迹提示词构造
     'build_trajectory_prompt',
+    'LLMIntentionGenerator',
+    'save_fragment_with_intention',
 
     # 轨迹变异
     'IntentionDrivenTrajectoryMutator',
     'mutate_trajectories',
-    'INTENTION_TEMPLATES',
+    'get_combination_count',
 
     # LLM 客户端
     'UnifiedLLMClient',
@@ -116,11 +123,16 @@ __all__ = [
 
     # LLM 数据模型
     'DrivingIntention',
-    'MutationParams',
     'IntentionPhase',
     'IntentionSequence',
+    'IntentionFrame',
 
     # 提示词构造
     'TrajectoryPromptBuilder',
     'SYSTEM_PROMPT',
+
+    # 意图生成
+    'identify_key_frames',
+    'generate_intention',
+    'parse_intention_response',
 ]
