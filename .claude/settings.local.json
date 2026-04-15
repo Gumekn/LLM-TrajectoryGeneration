@@ -17,7 +17,12 @@
       "Bash(python:*)",
       "Bash(git reset:*)",
       "Bash(git fetch:*)",
-      "Bash(dir \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\data\\\\processed\\\\\")"
+      "Bash(dir \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\data\\\\processed\\\\\")",
+      "Bash(git config:*)",
+      "Bash(env)",
+      "Bash(export https_proxy=http://127.0.0.1:7890)",
+      "Bash(gh api *)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
