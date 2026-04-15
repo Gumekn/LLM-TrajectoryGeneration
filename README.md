@@ -1,6 +1,6 @@
 # Trajectory Analysis Project
 
-基于大语言模型的车辆轨迹分析与风险评估系统。
+基于大语言模型的车辆轨迹分析与风险评估系统。???
 
 ## 项目简介
 
@@ -47,11 +47,13 @@ TrajectoryAnalysis/
 **重要设计原则**：模块不必独立成文件，可以是函数或类，整合在同一文件中。
 
 每个函数/类必须明确标注：
+
 1. **所在文件**：函数/类在哪个文件中定义
 2. **调用位置**：哪个文件/函数调用它
 3. **功能说明**：做什么
 
 示例（core/processor.py）：
+
 ```python
 class WaymoDataLoader:
     """Waymo数据加载器
@@ -74,32 +76,33 @@ class ScenarioRiskAnalyzer:
 
 ## 当前实现状态
 
-| 阶段 | 模块 | 文件 | 状态 |
-|------|------|------|------|
-| Week 1 | 数据加载 | core/processor.py (WaymoDataLoader) | ✓ 已实现 |
-| Week 1 | 风险计算 | core/processor.py (RiskCalculator, ScenarioRiskAnalyzer) | ✓ 已实现 |
-| Week 1 | 片段截取 | core/processor.py (ScenarioProcessor) | ✓ 已实现 |
-| Week 1 | 特征提取 | core/processor.py (extract_11d_features) | ✓ 已实现 |
-| Week 2-3 | RAG评估 | rag/ | 待实现 |
-| Week 4 | CARLA导出 | core/carla_adapter.py | 待实现 |
-| Week 5 | 界面开发 | ui/ | 待实现 |
+| 阶段     | 模块      | 文件                                                     | 状态      |
+| -------- | --------- | -------------------------------------------------------- | --------- |
+| Week 1   | 数据加载  | core/processor.py (WaymoDataLoader)                      | ✓ 已实现 |
+| Week 1   | 风险计算  | core/processor.py (RiskCalculator, ScenarioRiskAnalyzer) | ✓ 已实现 |
+| Week 1   | 片段截取  | core/processor.py (ScenarioProcessor)                    | ✓ 已实现 |
+| Week 1   | 特征提取  | core/processor.py (extract_11d_features)                 | ✓ 已实现 |
+| Week 2-3 | RAG评估   | rag/                                                     | 待实现    |
+| Week 4   | CARLA导出 | core/carla_adapter.py                                    | 待实现    |
+| Week 5   | 界面开发  | ui/                                                      | 待实现    |
 
 ## 快速开始
 
 1. **安装依赖**
+
    ```bash
    pip install -r requirements.txt
    ```
-
 2. **准备数据**
-   - 将Waymo数据放入 `data/waymo-open/`
 
+   - 将Waymo数据放入 `data/waymo-open/`
 3. **运行主程序**
+
    ```bash
    python core/Main.py
    ```
-
 4. **查看结果**
+
    - 处理后的JSON在 `data/processed/`
 
 ## 核心处理流程
@@ -129,6 +132,7 @@ Waymo原始pkl文件
 ## 文档
 
 详见 `docs/` 目录：
+
 - **项目框架（claude）.md** - 系统架构设计
 - **项目执行计划_详细版.md** - 详细执行计划
 - **轨迹生成模块设计.md** - Week 1模块设计
