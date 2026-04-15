@@ -16,7 +16,8 @@
       "Bash(mv /tmp/trimmed.md \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\docs\\\\项目框架（claude）.md\")",
       "Bash(python:*)",
       "Bash(git reset:*)",
-      "Bash(git fetch:*)"
+      "Bash(git fetch:*)",
+      "Bash(dir \"D:\\\\PythonProjects\\\\Python_projects_anaconda_zpb\\\\LLM-trajctory\\\\TrajectoryAnalysis\\\\data\\\\processed\\\\\")"
     ]
   }
 }
