@@ -1,21 +1,27 @@
 """
-core/trajectory_mutator.py - 意图驱动轨迹变异器（穷举版本）
+core/trajectory_mutator.py - 意图驱动轨迹变异器（v2：宏动作+DFS+TopK剪枝）
 
 职责：
-基于驾驶意图的穷举变异，生成所有有效的轨迹变体
+基于驾驶意图的穷举变异，生成最危险的轨迹变体
+
+核心算法：
+1. 意图合并（游程编码）：8~13个意图帧 → 3~5个IntentBlock
+2. 宏动作变异：每个Block起始帧选定(Delta_a, Delta_omega)，Block内保持恒定
+3. DFS深度优先遍历：3~5个Block，每Block 3种分支 → 最多243条轨迹
+4. Top-K%危险剪枝：按危险分数排序，只保留前K%最危险轨迹
 
 变异变量：
-    Delta_a: 纵向加速度增量 (m/s^2)，颗粒度 0.1
-    Delta_omega: 横摆角速度增量 (rad/s)，颗粒度 0.0087 (0.5度/s)
+    Delta_a: 纵向加速度增量 (m/s^2)
+    Delta_omega: 横摆角速度增量 (rad/s)
 
 运动学状态向量：
     S_t = [v_t, a_t, theta_t, omega_t, x_t, y_t]
 
-状态更新公式：
-    a_t = clamp(a_{t-1} + Delta_a, -8.0, 3.0)
-    omega_t = clamp(omega_{t-1} + Delta_omega, -0.349, 0.349)  # rad/s
-    v_t = max(0, v_{t-1} + a_t * dt)
-    theta_t = theta_{t-1} + omega_t * dt
+宏动作递推公式（Block内恒定控制）：
+    a_block = clamp(a_{t-1} + Delta_a, -8.0, 3.0)
+    omega_block = clamp(omega_{t-1} + Delta_omega, -0.35, 0.35)
+    v_t = max(0, v_{t-1} + a_block * dt)
+    theta_t = theta_{t-1} + omega_block * dt
     x_t = x_{t-1} + v_t * cos(theta_t) * dt
     y_t = y_{t-1} + v_t * sin(theta_t) * dt
 
@@ -23,12 +29,12 @@ core/trajectory_mutator.py - 意图驱动轨迹变异器（穷举版本）
     from core.trajectory_mutator import IntentionDrivenTrajectoryMutator
 
     mutator = IntentionDrivenTrajectoryMutator()
-    variants = mutator.mutate(fragment)
+    variants = mutator.mutate(fragment, top_k=10)
 """
 
 import math
-import itertools
-from typing import Dict, List, Optional, Any, Iterator, Tuple
+from typing import Dict, List, Optional, Any, Iterator, Tuple, NamedTuple
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -50,127 +56,189 @@ A_MIN = -8.0
 A_MAX = 3.0
 
 # 横摆角速度边界 (rad/s)
-# 20 deg/s = 20 * pi / 180 rad
-OMEGA_MIN = -20 * math.pi / 180  # -0.349 rad/s
-OMEGA_MAX = 20 * math.pi / 180   # 0.349 rad/s
+OMEGA_MIN = -0.35  # rad/s
+OMEGA_MAX = 0.35   # rad/s
 
 
 # =============================================================================
-# 变异变量离散值定义
+# 数据结构定义
 # =============================================================================
 
-# Delta_a: 纵向加速度增量 (m/s^2)
-# 变异全集: -0.5, -0.2, -0.1, 0, 0.1, 0.2
-DELTA_A_VALUES = [-0.5, -0.2, -0.1, 0.0, 0.1, 0.2]
+class IntentBlock(NamedTuple):
+    """意图区块：合并后的变异单元"""
+    intent: DrivingIntention
+    start_frame: int
+    end_frame: int
+    duration: float  # 秒
 
-# Delta_omega: 横摆角速度增量 (rad/s)
-# 变异全集: -1.0, -0.5, 0, 0.5, 1.0 deg/s
-# 转换为弧度: -0.01745, -0.00873, 0, 0.00873, 0.01745 rad
-DELTA_OMEGA_DEG = [-1.0, -0.5, 0.0, 0.5, 1.0]  # deg/s
-DELTA_OMEGA_VALUES = [d * math.pi / 180 for d in DELTA_OMEGA_DEG]  # rad/s
+    @property
+    def frame_count(self) -> int:
+        return self.end_frame - self.start_frame
+
+
+@dataclass
+class MutationCombo:
+    """变异组合"""
+    delta_a: float
+    delta_omega: float
+    description: str
+
+
+@dataclass
+class TrajectoryState:
+    """运动学状态"""
+    v: float      # 速度标量 (m/s)
+    a: float      # 纵向加速度 (m/s^2)
+    theta: float  # 航向角 (rad)
+    omega: float  # 横摆角速度 (rad/s)
+    x: float      # X坐标
+    y: float      # Y坐标
+
+    def to_dict(self) -> Dict:
+        return {
+            "v": self.v,
+            "a": self.a,
+            "theta": self.theta,
+            "omega": self.omega,
+            "x": self.x,
+            "y": self.y,
+        }
+
+
+@dataclass
+class RiskScore:
+    """危险分数"""
+    trajectory_id: int
+    risk_value: float
+    trajectory: Dict
 
 
 # =============================================================================
-# 意图剪枝规则
+# 意图钦定变异组合（每种意图3种最优组合）
 # =============================================================================
 
-class IntentionPruningRules:
-    """
-    意图剪枝规则 - 定义每个意图类型的有效变异组合
+INTENTION_MUTATIONS: Dict[DrivingIntention, List[MutationCombo]] = {
+    # 纯纵向意图
+    DrivingIntention.CRUISE_MAINTAIN: [
+        MutationCombo(-0.1, 0.0, "轻微减速"),
+        MutationCombo(0.0, 0.0, "保持不变"),
+        MutationCombo(0.1, 0.0, "轻微加速"),
+    ],
 
-    属性：
-        delta_a_values: 有效的 Delta_a 列表
-        delta_omega_values: 有效的 Delta_omega 列表
-        special_stop: 是否需要停车特判
-        lock_steering: 是否锁死方向盘
-    """
+    DrivingIntention.ACCELERATE_THROUGH: [
+        MutationCombo(0.0, 0.0087, "保持加速+微右转"),
+        MutationCombo(0.1, 0.0, "匀加速"),
+        MutationCombo(0.2, 0.0, "强加速"),
+    ],
 
-    def __init__(
-        self,
-        delta_a_values: List[float],
-        delta_omega_values: List[float],
-        special_stop: bool = False,
-        lock_steering: bool = False,
-    ):
-        self.delta_a_values = delta_a_values
-        self.delta_omega_values = delta_omega_values
-        self.special_stop = special_stop
-        self.lock_steering = lock_steering
+    DrivingIntention.DECELERATE_TO_YIELD: [
+        MutationCombo(-0.1, 0.0, "平缓减速"),
+        MutationCombo(-0.2, 0.0, "中等减速"),
+        MutationCombo(-0.5, 0.0, "急减速"),
+    ],
 
-    def generate_combinations(self) -> Iterator[Tuple[float, float]]:
-        """
-        生成该意图的所有有效变异组合
+    DrivingIntention.DECELERATE_TO_STOP: [
+        MutationCombo(-0.1, 0.0, "平缓停车"),
+        MutationCombo(-0.2, 0.0, "中等停车"),
+        MutationCombo(-0.5, 0.0, "快速停车"),
+    ],
 
-        穷举所有 Delta_a 和 Delta_omega 的笛卡尔积
-        """
-        for da in self.delta_a_values:
-            for dw in self.delta_omega_values:
-                yield (da, dw)
+    DrivingIntention.EMERGENCY_BRAKE: [
+        MutationCombo(-0.5, 0.0, "轻度急刹"),
+        MutationCombo(-1.0, 0.0, "中度急刹"),
+        MutationCombo(-2.0, 0.0, "重度急刹"),
+    ],
 
+    # 横向/综合意图
+    DrivingIntention.LANE_CHANGE_LEFT: [
+        MutationCombo(0.0, 0.0087, "慢速左变道"),
+        MutationCombo(0.0, 0.0175, "中速左变道"),
+        MutationCombo(0.0, 0.0349, "快速左变道"),
+    ],
 
-# 各意图的剪枝规则
-INTENTION_PRUNING: Dict[DrivingIntention, IntentionPruningRules] = {
-    # 类别1：纯纵向意图（限制 Delta_omega 约等于 0）
+    DrivingIntention.LANE_CHANGE_RIGHT: [
+        MutationCombo(0.0, -0.0087, "慢速右变道"),
+        MutationCombo(0.0, -0.0175, "中速右变道"),
+        MutationCombo(0.0, -0.0349, "快速右变道"),
+    ],
 
-    DrivingIntention.CRUISE_MAINTAIN: IntentionPruningRules(
-        delta_a_values=[-0.1, 0.0, 0.1],  # 趋零收敛
-        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
-    ),
+    DrivingIntention.TURN_LEFT: [
+        MutationCombo(-0.1, 0.0175, "入弯降速左转"),
+        MutationCombo(-0.2, 0.0175, "深度降速左转"),
+        MutationCombo(0.0, 0.0349, "保持速度左转"),
+    ],
 
-    DrivingIntention.ACCELERATE_THROUGH: IntentionPruningRules(
-        delta_a_values=[0.0, 0.1, 0.2],  # 强制非负
-        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
-    ),
+    DrivingIntention.TURN_RIGHT: [
+        MutationCombo(-0.1, -0.0175, "入弯降速右转"),
+        MutationCombo(-0.2, -0.0175, "深度降速右转"),
+        MutationCombo(0.0, -0.0349, "保持速度右转"),
+    ],
 
-    DrivingIntention.DECELERATE_TO_YIELD: IntentionPruningRules(
-        delta_a_values=[-0.2, -0.1, 0.0],  # 平缓减速
-        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
-    ),
+    DrivingIntention.GO_STRAIGHT: [
+        MutationCombo(-0.1, 0.0, "减速直行"),
+        MutationCombo(0.0, 0.0, "匀速直行"),
+        MutationCombo(0.1, 0.0, "加速直行"),
+    ],
 
-    DrivingIntention.DECELERATE_TO_STOP: IntentionPruningRules(
-        delta_a_values=[-0.2, -0.1, 0.0],  # 减速
-        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
-        special_stop=True,  # 需要停车特判
-    ),
-
-    DrivingIntention.EMERGENCY_BRAKE: IntentionPruningRules(
-        delta_a_values=[-0.5, -0.2],  # 强制深度减速
-        delta_omega_values=[0.0],  # 锁死方向盘
-        lock_steering=True,
-    ),
-
-    # 类别2：横向/综合意图
-
-    DrivingIntention.LANE_CHANGE_LEFT: IntentionPruningRules(
-        delta_a_values=[-0.1, 0.0, 0.1],
-        delta_omega_values=DELTA_OMEGA_VALUES[2:5],  # 0, 0.5, 1.0 deg/s
-    ),
-
-    DrivingIntention.LANE_CHANGE_RIGHT: IntentionPruningRules(
-        delta_a_values=[-0.1, 0.0, 0.1],
-        delta_omega_values=DELTA_OMEGA_VALUES[0:3],  # -1.0, -0.5, 0 deg/s
-    ),
-
-    DrivingIntention.TURN_LEFT: IntentionPruningRules(
-        delta_a_values=[-0.2, -0.1, 0.0, 0.1],  # 允许入弯降速
-        delta_omega_values=DELTA_OMEGA_VALUES[3:5],  # 0.5, 1.0 deg/s
-    ),
-
-    DrivingIntention.TURN_RIGHT: IntentionPruningRules(
-        delta_a_values=[-0.2, -0.1, 0.0, 0.1],
-        delta_omega_values=DELTA_OMEGA_VALUES[0:2],  # -1.0, -0.5 deg/s
-    ),
-
-    DrivingIntention.GO_STRAIGHT: IntentionPruningRules(
-        delta_a_values=[-0.2, -0.1, 0.0, 0.1, 0.2],  # 自由跟车
-        delta_omega_values=DELTA_OMEGA_VALUES[1:4],  # -0.5, 0, 0.5 deg/s
-    ),
-
-    DrivingIntention.UNKNOWN: IntentionPruningRules(
-        delta_a_values=[-0.1, 0.0, 0.1],
-        delta_omega_values=[0.0],
-    ),
+    DrivingIntention.UNKNOWN: [
+        MutationCombo(-0.1, 0.0, "轻微减速"),
+        MutationCombo(0.0, 0.0, "保持不变"),
+        MutationCombo(0.1, 0.0, "轻微加速"),
+    ],
 }
+
+
+# =============================================================================
+# 意图合并（游程编码）
+# =============================================================================
+
+def merge_intentions(intention_seq: IntentionSequence) -> List[IntentBlock]:
+    """
+    将意图序列合并为意图区块（游程编码）
+
+    相邻且相同的意图合并为一个IntentBlock
+
+    参数：
+        intention_seq: 意图序列
+
+    返回：
+        IntentBlock列表
+    """
+    if not intention_seq.phases:
+        # 默认单一Block
+        return [IntentBlock(
+            intent=DrivingIntention.CRUISE_MAINTAIN,
+            start_frame=0,
+            end_frame=50,
+            duration=5.0
+        )]
+
+    blocks = []
+    current_intent = intention_seq.phases[0].intention
+    current_start = intention_seq.phases[0].start_frame
+
+    for phase in intention_seq.phases:
+        if phase.intention != current_intent:
+            # 意图变更，保存当前Block
+            blocks.append(IntentBlock(
+                intent=current_intent,
+                start_frame=current_start,
+                end_frame=phase.start_frame,
+                duration=(phase.start_frame - current_start) * DT
+            ))
+            current_intent = phase.intention
+            current_start = phase.start_frame
+
+    # 保存最后一个Block
+    last_phase = intention_seq.phases[-1]
+    blocks.append(IntentBlock(
+        intent=current_intent,
+        start_frame=current_start,
+        end_frame=last_phase.end_frame,
+        duration=(last_phase.end_frame - current_start) * DT
+    ))
+
+    return blocks
 
 
 # =============================================================================
@@ -189,30 +257,25 @@ def compute_speed_from_velocity(velocity: List[float]) -> float:
     return math.sqrt(velocity[0]**2 + velocity[1]**2)
 
 
-def compute_initial_state(trajectory: Dict) -> Dict:
+def compute_initial_state(trajectory: Dict) -> TrajectoryState:
     """
     从原始轨迹数据计算初始状态
-
-    参数：
-        trajectory: VehicleTrajectory 结构，包含 positions, headings, velocities, accelerations
-
-    返回：
-        初始状态字典 {v, a, theta, omega, x, y}
     """
     velocities = trajectory.get("velocities", [[0.0, 0.0]])
     headings = trajectory.get("headings", [0.0])
     positions = trajectory.get("positions", [[0.0, 0.0, 0.0]])
+    accelerations = trajectory.get("accelerations", [[0.0, 0.0]])
 
     # 速度标量
     v = compute_speed_from_velocity(velocities[0]) if velocities else 0.0
 
-    # 纵向加速度（取局部坐标系X分量）
-    a = velocities[0][0] if velocities else 0.0  # 默认用速度近似
+    # 纵向加速度
+    a = accelerations[0][0] if accelerations else 0.0
 
     # 航向角
     theta = headings[0] if headings else 0.0
 
-    # 横摆角速度：通过相邻帧航向差分计算
+    # 横摆角速度
     if len(headings) >= 2:
         omega = (headings[1] - headings[0]) / DT
     else:
@@ -222,301 +285,273 @@ def compute_initial_state(trajectory: Dict) -> Dict:
     x = positions[0][0] if positions else 0.0
     y = positions[0][1] if positions else 0.0
 
-    return {
-        "v": v,
-        "a": a,
-        "theta": theta,
-        "omega": omega,
-        "x": x,
-        "y": y,
-    }
+    return TrajectoryState(v=v, a=a, theta=theta, omega=omega, x=x, y=y)
 
 
-def integrate_state(
-    state: Dict,
+def compute_block_control(
+    current_state: TrajectoryState,
     delta_a: float,
-    delta_omega: float,
-    dt: float = DT
-) -> Dict:
+    delta_omega: float
+) -> Tuple[float, float]:
     """
-    运动学状态积分 - 根据变异量计算下一帧状态
+    计算区块恒定控制量
+
+    参数：
+        current_state: 当前状态
+        delta_a: 纵向加速度增量
+        delta_omega: 横摆角速度增量
+
+    返回：
+        (a_block, omega_block)
+    """
+    a_block = clamp(current_state.a + delta_a, A_MIN, A_MAX)
+    omega_block = clamp(current_state.omega + delta_omega, OMEGA_MIN, OMEGA_MAX)
+    return a_block, omega_block
+
+
+def kinematically_integrate(
+    state: TrajectoryState,
+    a_block: float,
+    omega_block: float,
+    z: float = 0.0
+) -> TrajectoryState:
+    """
+    运动学积分一步
 
     公式：
-        a_t = clamp(a_{t-1} + Delta_a, -8.0, 3.0)
-        omega_t = clamp(omega_{t-1} + Delta_omega, -0.349, 0.349)
-        v_t = max(0, v_{t-1} + a_t * dt)
-        theta_t = theta_{t-1} + omega_t * dt
+        v_t = max(0, v_{t-1} + a_block * dt)
+        theta_t = theta_{t-1} + omega_block * dt
         x_t = x_{t-1} + v_t * cos(theta_t) * dt
         y_t = y_{t-1} + v_t * sin(theta_t) * dt
 
     参数：
-        state: 当前状态字典 {v, a, theta, omega, x, y}
-        delta_a: 纵向加速度增量 (m/s^2)
-        delta_omega: 横摆角速度增量 (rad/s)
-        dt: 时间步长
+        state: 当前状态
+        a_block: 区块恒定纵向加速度
+        omega_block: 区块恒定横摆角速度
+        z: Z坐标（固定）
 
     返回：
-        下一帧状态字典
+        下一帧状态
     """
-    v_prev = state["v"]
-    a_prev = state["a"]
-    theta_prev = state["theta"]
-    omega_prev = state["omega"]
-    x_prev = state["x"]
-    y_prev = state["y"]
+    v = max(0.0, state.v + a_block * DT)
+    theta = state.theta + omega_block * DT
+    x = state.x + v * math.cos(theta) * DT
+    y = state.y + v * math.sin(theta) * DT
 
-    # 加速度更新
-    a = clamp(a_prev + delta_a, A_MIN, A_MAX)
-
-    # 横摆角速度更新
-    omega = clamp(omega_prev + delta_omega, OMEGA_MIN, OMEGA_MAX)
-
-    # 速度更新（确保非负）
-    v = max(0.0, v_prev + a * dt)
-
-    # 航向角更新
-    theta = theta_prev + omega * dt
-
-    # 位置更新
-    x = x_prev + v * math.cos(theta) * dt
-    y = y_prev + v * math.sin(theta) * dt
-
-    return {
-        "v": v,
-        "a": a,
-        "theta": theta,
-        "omega": omega,
-        "x": x,
-        "y": y,
-    }
+    return TrajectoryState(
+        v=v,
+        a=a_block,
+        theta=theta,
+        omega=omega_block,
+        x=x,
+        y=y
+    )
 
 
 # =============================================================================
-# 轨迹变异器
+# 危险分数计算
 # =============================================================================
 
-class IntentionDrivenTrajectoryMutator:
+def compute_risk_score(
+    trajectory: Dict,
+    target_trajectory: Optional[Dict] = None
+) -> float:
     """
-    意图驱动轨迹变异器（穷举版本）
+    计算轨迹危险分数
 
-    根据意图序列穷举生成所有有效的轨迹变体
+    基于与目标轨迹的接近程度和碰撞时间TTC
 
-    使用示例：
-        mutator = IntentionDrivenTrajectoryMutator()
-        variants = mutator.mutate(fragment)
+    参数：
+        trajectory: 变异后的轨迹
+        target_trajectory: 原始轨迹（用于计算相对指标）
+
+    返回：
+        危险分数（越大越危险）
+    """
+    positions = trajectory.get("positions", [])
+    velocities = trajectory.get("velocities", [])
+
+    if not positions or len(positions) < 2:
+        return 0.0
+
+    # 如果没有目标轨迹，使用速度变化率和加速度作为危险指标
+    if target_trajectory is None:
+        risk = 0.0
+        for i in range(1, len(positions)):
+            dx = positions[i][0] - positions[i-1][0]
+            dy = positions[i][1] - positions[i-1][1]
+            # 使用加速度变化作为危险指标
+            if velocities and i < len(velocities):
+                accel = velocities[i][0]
+                risk += abs(accel) * 0.1
+        return risk / len(positions)
+
+    # 计算与目标轨迹的偏离程度
+    target_positions = target_trajectory.get("positions", [])
+    if not target_positions:
+        return 0.0
+
+    risk = 0.0
+    min_dist = float('inf')
+
+    for i in range(min(len(positions), len(target_positions))):
+        dx = positions[i][0] - target_positions[i][0]
+        dy = positions[i][1] - target_positions[i][1]
+        dist = math.sqrt(dx*dx + dy*dy)
+
+        # 距离越近越危险
+        risk += 1.0 / (dist + 0.1)
+
+        # 记录最小距离
+        if dist < min_dist:
+            min_dist = dist
+
+    # 考虑速度差异
+    target_velocities = target_trajectory.get("velocities", [])
+    if target_velocities:
+        for i in range(min(len(velocities), len(target_velocities))):
+            dv = velocities[i][0] - target_velocities[i][0]
+            risk += abs(dv) * 0.5
+
+    return risk
+
+
+# =============================================================================
+# DFS + Top-K% 剪枝算法
+# =============================================================================
+
+class DFSMutator:
+    """
+    深度优先搜索轨迹变异器
+
+    使用DFS遍历所有Block的变异组合，
+    生成轨迹后按危险分数排序，保留Top-K%
     """
 
-    def mutate(self, fragment: Dict) -> List[Dict]:
-        """
-        穷举生成所有轨迹变体
-
-        参数：
-            fragment: 原始轨迹片段数据（包含意图序列和轨迹）
-
-        返回：
-            所有变体轨迹列表
-        """
-        # 解析片段数据
-        frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
-        target = frag.get("target_trajectory", {})
-        frame_count = frag.get("frame_count", 50)
-
-        # 获取意图序列
-        intention_seq = self._build_intention_sequence(frag)
-
-        # 收集每个意图段的变异组合
-        segment_combinations = []
-        for phase in intention_seq.phases:
-            rules = INTENTION_PRUNING.get(
-                phase.intention,
-                INTENTION_PRUNING[DrivingIntention.UNKNOWN]
-            )
-            combos = list(rules.generate_combinations())
-            segment_combinations.append({
-                "phase": phase,
-                "combinations": combos,
-                "rules": rules,
-            })
-
-        # 计算总变体数
-        total_variants = 1
-        for seg in segment_combinations:
-            total_variants *= len(seg["combinations"])
-
-        print(f"意图段数量: {len(segment_combinations)}")
-        print(f"各段组合数: {[len(seg['combinations']) for seg in segment_combinations]}")
-        print(f"总变体数量: {total_variants}")
-
-        # 穷举生成所有变体
-        variants = []
-        variant_id = 0
-
-        # 递归穷举所有段的组合
-        for combo_tuple in self._enumerate_combinations(segment_combinations, 0, []):
-            variant = self._generate_trajectory(
-                target, intention_seq, combo_tuple, variant_id, frame_count
-            )
-            variants.append(variant)
-            variant_id += 1
-
-            if variant_id % 1000 == 0:
-                print(f"已生成 {variant_id}/{total_variants} 个变体...")
-
-        print(f"完成！共生成 {len(variants)} 个变体")
-        return variants
-
-    def _build_intention_sequence(self, frag: Dict) -> IntentionSequence:
-        """
-        构建意图序列
-
-        如果片段中包含意图数据，使用片段中的意图
-        否则使用默认的单一意图段
-        """
-        # 检查是否有意图分析结果
-        intention_analysis = frag.get("intention_analysis", {})
-
-        if intention_analysis and "intention_frames" in intention_analysis:
-            # 从意图帧构建意图序列
-            frames = intention_analysis["intention_frames"]
-            if frames:
-                # 使用第一个意图帧的意图作为整个轨迹的意图
-                first_intention = frames[0].get("intention", "cruise_maintain")
-                try:
-                    intention = DrivingIntention(first_intention)
-                except ValueError:
-                    intention = DrivingIntention.CRUISE_MAINTAIN
-
-                return IntentionSequence(
-                    phases=[
-                        IntentionPhase(
-                            start_frame=0,
-                            end_frame=frag.get("frame_count", 50),
-                            intention=intention,
-                            reasoning="从意图帧推断"
-                        )
-                    ],
-                    overall_strategy="意图驱动"
-                )
-
-        # 默认意图序列
-        frame_count = frag.get("frame_count", 50)
-        return IntentionSequence(
-            phases=[
-                IntentionPhase(
-                    start_frame=0,
-                    end_frame=frame_count,
-                    intention=DrivingIntention.CRUISE_MAINTAIN,
-                    reasoning="默认意图"
-                )
-            ],
-            overall_strategy="默认策略"
-        )
-
-    def _enumerate_combinations(
+    def __init__(
         self,
-        segments: List[Dict],
-        idx: int,
-        current: List[Tuple[float, float]]
-    ) -> Iterator[List[Tuple[float, float]]]:
-        """
-        递归穷举所有意图段的参数组合
+        blocks: List[IntentBlock],
+        target_trajectory: Dict,
+        top_k: float = 10.0
+    ):
+        self.blocks = blocks
+        self.target_trajectory = target_trajectory
+        self.top_k = top_k
+        self.variant_id = 0
+        self.results: List[RiskScore] = []
 
-        参数：
-            segments: 意图段列表
-            idx: 当前处理的段索引
-            current: 当前累积的组合列表
+    def mutate(self) -> List[Dict]:
+        """执行DFS变异，返回Top-K%危险轨迹"""
+        # 计算初始状态
+        initial_state = compute_initial_state(self.target_trajectory)
+        frame_count = self.target_trajectory.get("frame_count", 50)
 
-        返回：
-            完整组合列表的迭代器
-        """
-        if idx >= len(segments):
-            yield current.copy()
+        # DFS遍历
+        self._dfs(0, initial_state, [], [])
+
+        # 按危险分数排序
+        self.results.sort(key=lambda x: x.risk_value, reverse=True)
+
+        # Top-K%筛选
+        k = max(1, int(len(self.results) * self.top_k / 100))
+        top_results = self.results[:k]
+
+        print(f"DFS完成：共生成 {len(self.results)} 条轨迹，保留 Top-{self.top_k}% = {k} 条")
+
+        return [r.trajectory for r in top_results]
+
+    def _dfs(
+        self,
+        block_idx: int,
+        current_state: TrajectoryState,
+        trajectory_states: List,
+        mutation_log: List[Dict]
+    ):
+        """深度优先搜索"""
+        if block_idx >= len(self.blocks):
+            # 到达叶子节点，生成完整轨迹
+            trajectory = self._build_trajectory(
+                trajectory_states,
+                mutation_log,
+                len(self.blocks)
+            )
+            risk = compute_risk_score(trajectory, self.target_trajectory)
+            self.results.append(RiskScore(
+                trajectory_id=self.variant_id,
+                risk_value=risk,
+                trajectory=trajectory
+            ))
+            self.variant_id += 1
             return
 
-        for combo in segments[idx]["combinations"]:
-            current.append(combo)
-            yield from self._enumerate_combinations(segments, idx + 1, current)
-            current.pop()
+        block = self.blocks[block_idx]
 
-    def _generate_trajectory(
+        # 获取该意图的变异组合
+        mutations = INTENTION_MUTATIONS.get(
+            block.intent,
+            INTENTION_MUTATIONS[DrivingIntention.UNKNOWN]
+        )
+
+        for mutation in mutations:
+            # 计算区块恒定控制量
+            a_block, omega_block = compute_block_control(
+                current_state, mutation.delta_a, mutation.delta_omega
+            )
+
+            # 递推该Block内所有帧
+            new_states = []
+            state = current_state
+            for _ in range(block.frame_count):
+                state = kinematically_integrate(state, a_block, omega_block)
+                new_states.append(state)
+
+            # 记录变异日志
+            new_log = mutation_log + [{
+                "block_idx": block_idx,
+                "intent": block.intent.value,
+                "start_frame": block.start_frame,
+                "end_frame": block.end_frame,
+                "delta_a": mutation.delta_a,
+                "delta_omega": mutation.delta_omega,
+                "a_block": a_block,
+                "omega_block": omega_block,
+                "description": mutation.description,
+            }]
+
+            # 递归处理下一Block
+            self._dfs(
+                block_idx + 1,
+                state,
+                trajectory_states + new_states,
+                new_log
+            )
+
+    def _build_trajectory(
         self,
-        target: Dict,
-        intention_seq: IntentionSequence,
-        combo_list: List[Tuple[float, float]],
-        variant_id: int,
-        frame_count: int,
+        states: List[TrajectoryState],
+        mutation_log: List[Dict],
+        block_count: int
     ) -> Dict:
-        """
-        根据变异组合生成一条轨迹
-
-        参数：
-            target: 原始轨迹数据
-            intention_seq: 意图序列
-            combo_list: 各意图段对应的 (Delta_a, Delta_omega) 组合列表
-            variant_id: 变体编号
-            frame_count: 总帧数
-
-        返回：
-            变体字典
-        """
-        # 计算初始状态
-        state = compute_initial_state(target)
-
-        # 初始化输出数组
+        """根据状态列表构建轨迹字典"""
+        frame_count = len(states)
         positions = np.zeros((frame_count, 3))
         headings = np.zeros(frame_count)
         velocities = np.zeros((frame_count, 2))
         accelerations = np.zeros((frame_count, 2))
 
-        # 特殊处理：停车标志
-        stopped = False
+        # 获取原始Z坐标
+        orig_positions = self.target_trajectory.get("positions", [[0, 0, 0]] * frame_count)
 
-        # 获取每个意图段对应的组合索引
-        combo_idx = 0
-
-        for t in range(frame_count):
-            # 存储当前状态
-            positions[t] = [state["x"], state["y"], target.get("positions", [[0, 0, 0]])[0][2]]
-            headings[t] = state["theta"]
-            velocities[t] = [state["v"], 0.0]  # 局部坐标系：纵向速度 v，横向 0
-            accelerations[t] = [state["a"], state["v"] * state["omega"]]  # 纵向加速度，向心加速度
-
-            # 确定当前帧对应的变异组合
-            delta_a, delta_omega = self._get_combo_for_frame(
-                intention_seq, combo_list, t, combo_idx
-            )
-
-            # 更新组合索引
-            for i, phase in enumerate(intention_seq.phases):
-                if t == phase.start_frame and i > combo_idx:
-                    combo_idx = i
-
-            # 特殊判断：停车
-            if stopped:
-                state = {
-                    "v": 0.0,
-                    "a": 0.0,
-                    "theta": state["theta"],
-                    "omega": 0.0,
-                    "x": state["x"],
-                    "y": state["y"],
-                }
-            else:
-                # 运动学积分
-                state = integrate_state(state, delta_a, delta_omega)
-
-                # 检查是否需要停车特判
-                if self._should_stop(state, intention_seq, t):
-                    stopped = True
+        for i, state in enumerate(states):
+            positions[i] = [state.x, state.y, orig_positions[i][2] if i < len(orig_positions) else 0.0]
+            headings[i] = state.theta
+            velocities[i] = [state.v, 0.0]  # 局部坐标系
+            accelerations[i] = [state.a, state.v * state.omega]  # 纵向+向心加速度
 
         return {
-            "original_fragment_id": target.get("fragment_id", "unknown"),
-            "intention_sequence": intention_seq.to_dict(),
-            "variant_id": variant_id,
-            "params": [
-                {"phase": phase.start_frame, "delta_a": combo[0], "delta_omega": combo[1]}
-                for phase, combo in zip(intention_seq.phases, combo_list)
-            ],
+            "original_fragment_id": self.target_trajectory.get("fragment_id", "unknown"),
+            "variant_id": self.variant_id - 1,  # 已在叶子节点递增
+            "mutation_log": mutation_log,
             "trajectory": {
                 "positions": positions.tolist(),
                 "headings": headings.tolist(),
@@ -526,66 +561,145 @@ class IntentionDrivenTrajectoryMutator:
             }
         }
 
-    def _get_combo_for_frame(
-        self,
-        intention_seq: IntentionSequence,
-        combo_list: List[Tuple[float, float]],
-        frame: int,
-        current_idx: int
-    ) -> Tuple[float, float]:
-        """获取指定帧对应的变异组合"""
-        for i, phase in enumerate(intention_seq.phases):
-            if phase.start_frame <= frame < phase.end_frame:
-                if i < len(combo_list):
-                    return combo_list[i]
-                else:
-                    return (0.0, 0.0)
-        return (0.0, 0.0)
 
-    def _should_stop(
-        self,
-        state: Dict,
-        intention_seq: IntentionSequence,
-        frame: int
-    ) -> bool:
-        """判断是否应该停车"""
-        for phase in intention_seq.phases:
-            if phase.start_frame <= frame < phase.end_frame:
-                rules = INTENTION_PRUNING.get(
-                    phase.intention,
-                    INTENTIONPruningRules([-0.1, 0.0, 0.1], [0.0])
-                )
-                # decelerate_to_stop 特判：速度为0时强制停车
-                if rules.special_stop and state["v"] <= 0.01:
-                    return True
-        return False
+# =============================================================================
+# 轨迹变异器主类
+# =============================================================================
 
-
-def mutate_trajectories(fragment: Dict) -> List[Dict]:
+class IntentionDrivenTrajectoryMutator:
     """
-    便捷函数：穷举生成所有轨迹变体
+    意图驱动轨迹变异器（v2）
+
+    算法：
+    1. 意图合并（游程编码）
+    2. 宏动作变异（Block内恒定控制量）
+    3. DFS深度优先遍历
+    4. Top-K%危险剪枝
+
+    使用示例：
+        mutator = IntentionDrivenTrajectoryMutator()
+        variants = mutator.mutate(fragment, top_k=10)
+    """
+
+    def __init__(self, top_k: float = 10.0):
+        """
+        参数：
+            top_k: 保留最危险轨迹的比例（默认10%）
+        """
+        self.top_k = top_k
+
+    def mutate(self, fragment: Dict, top_k: Optional[float] = None) -> List[Dict]:
+        """
+        穷举生成Top-K%最危险轨迹
+
+        参数：
+            fragment: 原始轨迹片段（包含意图序列）
+            top_k: 保留最危险轨迹的比例（默认10%）
+
+        返回：
+            危险轨迹变体列表
+        """
+        if top_k is None:
+            top_k = self.top_k
+
+        # 解析片段数据
+        frag = fragment.get("fragment", fragment) if "fragment" in fragment else fragment
+        target = frag.get("target_trajectory", frag)
+        frame_count = frag.get("frame_count", 50)
+
+        # 构建意图序列
+        intention_seq = self._build_intention_sequence(frag)
+
+        # 意图合并（游程编码）
+        blocks = merge_intentions(intention_seq)
+
+        print(f"意图合并后Block数量: {len(blocks)}")
+        for i, block in enumerate(blocks):
+            print(f"  Block {i}: {block.intent.value}, [{block.start_frame}, {block.end_frame}], {block.duration}s")
+
+        # DFS + Top-K%变异
+        dfs_mutator = DFSMutator(blocks, target, top_k=top_k)
+        variants = dfs_mutator.mutate()
+
+        return variants
+
+    def _build_intention_sequence(self, frag: Dict) -> IntentionSequence:
+        """
+        从片段数据构建意图序列
+
+        如果有意图分析结果，使用分析结果
+        否则使用默认意图序列
+        """
+        intention_analysis = frag.get("intention_analysis", {})
+
+        if intention_analysis and "intention_frames" in intention_analysis:
+            # 从意图帧构建意图序列
+            frames = intention_analysis["intention_frames"]
+            if frames:
+                # 按frame排序
+                sorted_frames = sorted(frames, key=lambda x: x.get("frame", 0))
+
+                # 构建phase列表
+                phases = []
+                for f in sorted_frames:
+                    frame_num = f.get("frame", 0)
+                    intent_str = f.get("intention", "cruise_maintain")
+                    try:
+                        intent = DrivingIntention(intent_str)
+                    except ValueError:
+                        intent = DrivingIntention.CRUISE_MAINTAIN
+
+                    # 假设每帧持续0.5s（关键帧间隔）
+                    phases.append(IntentionPhase(
+                        start_frame=int(frame_num),
+                        end_frame=min(int(frame_num) + 5, 50),
+                        intention=intent,
+                        reasoning=f.get("reasoning", "")
+                    ))
+
+                if phases:
+                    return IntentionSequence(
+                        phases=phases,
+                        overall_strategy=intention_analysis.get("overall_strategy", "意图驱动")
+                    )
+
+        # 默认意图序列（cruise_maintain整个轨迹）
+        return IntentionSequence(
+            phases=[
+                IntentionPhase(
+                    start_frame=0,
+                    end_frame=50,
+                    intention=DrivingIntention.CRUISE_MAINTAIN,
+                    reasoning="默认意图"
+                )
+            ],
+            overall_strategy="默认策略"
+        )
+
+
+def mutate_trajectories(fragment: Dict, top_k: float = 10.0) -> List[Dict]:
+    """
+    便捷函数：穷举生成Top-K%最危险轨迹
 
     参数：
         fragment: 原始轨迹片段
+        top_k: 保留最危险轨迹的比例（默认10%）
 
     返回：
-        所有变异后的轨迹列表
+        危险轨迹变体列表
     """
-    mutator = IntentionDrivenTrajectoryMutator()
-    return mutator.mutate(fragment)
+    mutator = IntentionDrivenTrajectoryMutator(top_k=top_k)
+    return mutator.mutate(fragment, top_k=top_k)
 
 
 def get_combination_count(intention: DrivingIntention) -> int:
     """
-    获取指定意图类型的有效组合数
+    获取指定意图类型的有效组合数（固定为3）
 
     参数：
         intention: 驾驶意图类型
 
     返回：
-        有效变异组合数量
+        有效变异组合数量（固定3）
     """
-    rules = INTENTION_PRUNING.get(intention)
-    if rules is None:
-        return 0
-    return len(list(rules.generate_combinations()))
+    return len(INTENTION_MUTATIONS.get(intention, []))
