@@ -22,7 +22,14 @@
       "Bash(env)",
       "Bash(export https_proxy=http://127.0.0.1:7890)",
       "Bash(gh api *)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(git mv *)",
+      "Bash(git rm *)",
+      "Bash(mv \"项目框架（claude）.md\" 00_项目总体/)",
+      "Bash(mv \"项目执行计划_详细版.md\" 00_项目总体/)",
+      "Bash(mv \"学术版框架.md\" 00_项目总体/)",
+      "Bash(mv \"轨迹生成模块设计.md\" 01_阶段设计/)",
+      "Bash(mv \"llm意图生成模块设计.md\" 01_阶段设计/)"
     ]
   }
 }
