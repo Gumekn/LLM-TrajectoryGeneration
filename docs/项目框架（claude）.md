@@ -1645,27 +1645,35 @@ tests/
 
 | 模块 | 文件 | 状态 | 备注 |
 |------|------|------|------|
-| 提示词构建 | core/llm/prompt_builder.py | ✓ 已实现 | 意图类型定义 + SYSTEM_PROMPT + TrajectoryPromptBuilder |
-| LLM客户端 | core/llm/intention_models.py | ✓ 已实现 | UnifiedLLMClient（qwen/openai/gemini） |
-| 调用入口 | core/llm_intention_generator.py | ✓ 已实现 | build_trajectory_prompt + save_fragment_with_intention |
-| 轨迹变异器 | core/trajectory_mutator.py | ✓ 已实现 | 意图驱动轨迹变异 |
-| 测试脚本 | test_step1_prompt.py | ✓ 已实现 | Step 1 提示词构建测试 |
+| 提示词构建 | core/stage2/llm/prompt_builder.py | ✓ 已实现 | 意图类型定义 + SYSTEM_PROMPT + TrajectoryPromptBuilder |
+| LLM客户端 | core/stage2/llm/config.py | ✓ 已实现 | UnifiedLLMClient（qwen/openai/gemini） |
+| 意图生成器 | core/stage2/intention_generator.py | ✓ 已实现 | LLMIntentionGenerator + 核心函数 |
+| 轨迹变异器 | core/stage2/mutator.py | ✓ 已实现 | 意图驱动轨迹变异 |
+| 数据持久化 | core/stage2/storage.py | ✓ 已实现 | 带意图片段和变异结果保存 |
+| 入口脚本 | core/stage2/run_intention.py | ✓ 已实现 | 意图生成入口 |
+| 入口脚本 | core/stage2/run_mutation.py | ✓ 已实现 | 轨迹变异入口 |
 
 ### 当前目录结构
 
 ```
 TrajectoryAnalysis/
 ├── core/                           # 核心处理模块
-│   ├── Main.py                     # 主程序入口（Step 1-4 调度）
-│   ├── processor.py                # 整合模块（见下方模块清单）
-│   ├── __init__.py                 # 模块导出
-│   ├── llm_intention_generator.py  # LLM意图生成器入口
-│   ├── trajectory_mutator.py       # 意图驱动轨迹变异器
-│   └── llm/                        # LLM相关模块
-│       ├── __init__.py            # 统一导出
-│       ├── config.py              # 配置管理
-│       ├── intention_models.py     # 仅 LLM 客户端 (UnifiedLLMClient)
-│       └── prompt_builder.py        # 提示词构建（意图类型 + SYSTEM_PROMPT + TrajectoryPromptBuilder）
+│   ├── __init__.py
+│   ├── stage1/                     # Stage 1: 轨迹生成
+│   │   ├── __init__.py
+│   │   ├── main.py                # 主程序入口
+│   │   └── processor.py            # 数据类型、数据加载、风险计算、片段截取
+│   └── stage2/                     # Stage 2: 意图生成 + 轨迹变异
+│       ├── __init__.py
+│       ├── intention_generator.py  # 意图生成核心（LLMIntentionGenerator + 核心函数）
+│       ├── mutator.py              # 轨迹变异器
+│       ├── storage.py              # 数据持久化
+│       ├── run_intention.py        # 意图生成入口脚本
+│       ├── run_mutation.py         # 轨迹变异入口脚本
+│       └── llm/                    # LLM 相关模块
+│           ├── __init__.py
+│           ├── config.py          # LLM API 配置
+│           └── prompt_builder.py   # 提示词构造
 │
 ├── rag/                            # RAG知识库模块（待实现）
 │   └── __init__.py
@@ -1677,16 +1685,12 @@ TrajectoryAnalysis/
 │   └── __init__.py
 │
 ├── docs/                           # 文档目录
-│   ├── 项目框架（claude）.md      # 本文档
-│   ├── 项目执行计划_详细版.md     # 详细执行计划
-│   ├── Week1执行总结.md          # Week 1执行总结
-│   ├── 轨迹生成模块设计.md       # 轨迹生成模块设计
-│   └── LLM意图驱动轨迹变异系统实现计划.md  # LLM系统设计
 │
 ├── data/                           # 数据目录
 │   ├── waymo-open/                # 原始Waymo数据（pkl）
-│   ├── processed/                  # 处理后数据（JSON格式）
-│   └── intention/                   # 带意图的片段数据
+│   ├── processed/                  # 处理后数据（JSON，Stage 1 输出）
+│   ├── intention/                  # 带意图片段（Stage 2a 输出）
+│   └── variants/                    # 变异轨迹（Stage 2b 输出）
 │
 ├── test_step1_prompt.py           # Step 1 提示词构建测试脚本
 ├── 素材参考/                        # 归档素材文件
@@ -1708,10 +1712,12 @@ TrajectoryAnalysis/
 
 | 文件 | 职责 |
 |------|------|
-| `core/llm/prompt_builder.py` | **唯一的提示词构建位置**：意图类型定义(DrivingIntention)、系统提示词(SYSTEM_PROMPT)、轨迹提示词构造(TrajectoryPromptBuilder) |
-| `core/llm/intention_models.py` | 仅 LLM 客户端：UnifiedLLMClient 支持 qwen/openai/gemini |
-| `core/llm_intention_generator.py` | 调用入口：组合 prompt_builder 和 intention_models，提供 build_trajectory_prompt()、save_fragment_with_intention() 等 |
-| `core/trajectory_mutator.py` | 轨迹变异器：从意图序列生成变异轨迹 |
+| `core/stage2/llm/prompt_builder.py` | **唯一的提示词构建位置**：意图类型定义(DrivingIntention)、系统提示词(SYSTEM_PROMPT)、轨迹提示词构造(TrajectoryPromptBuilder) |
+| `core/stage2/llm/config.py` | LLM 客户端：UnifiedLLMClient 支持 qwen/openai/gemini |
+| `core/stage2/intention_generator.py` | 意图生成核心：LLMIntentionGenerator类 + identify_key_frames + parse_intention_response 等核心函数 |
+| `core/stage2/mutator.py` | 轨迹变异器：从意图序列生成变异轨迹 |
+| `core/stage2/run_intention.py` | 意图生成入口脚本 |
+| `core/stage2/run_mutation.py` | 轨迹变异入口脚本 |
 
 示例（core/processor.py）：
 ```python
@@ -1748,8 +1754,8 @@ class ScenarioRiskAnalyzer:
 
 ---
 
-*文档版本: v2.4*
+*文档版本: v2.5*
 *技术方案: 穷举生成 + LLM剪枝*
-*最后更新: 2026-04-14*
-*Week 1完成状态: ✓ 已完成（优化版）*
-*LLM系统状态: ✓ Step 1 提示词构建已完成并测试通过*
+*最后更新: 2026-04-18*
+*Stage 1完成状态: ✓ 已完成*
+*Stage 2完成状态: ✓ 意图生成 + 轨迹变异已完成，入口脚本已就绪*

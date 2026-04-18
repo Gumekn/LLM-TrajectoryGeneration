@@ -74,7 +74,7 @@ full_prompt = build_intention_query_prompt(trajectory_prompt, key_frames, SYSTEM
 
 ### 4. LLM API 配置 ✅
 
-**文件位置**: `core/llm/intention_models.py` - `UnifiedLLMClient` 类
+**文件位置**: `core/stage2/llm/config.py` - `UnifiedLLMClient` 类
 
 **实现内容**:
 - 支持的提供商：qwen、openai、gemini
@@ -97,7 +97,7 @@ response = client.chat("你的问题")
 
 ### 5. 场景轨迹生成代码 ✅
 
-**文件位置**: `core/llm_intention_generator.py` - `LLMIntentionGenerator` 类
+**文件位置**: `core/stage2/intention_generator.py` - `LLMIntentionGenerator` 类
 
 **实现内容**:
 - 完整流程封装（Step 1-5）
@@ -112,7 +112,7 @@ response = client.chat("你的问题")
 
 **调用方式**:
 ```python
-from core.llm_intention_generator import LLMIntentionGenerator
+from core.stage2.intention_generator import LLMIntentionGenerator
 generator = LLMIntentionGenerator(provider="qwen", model="qwen3.6-plus")
 result = generator.generate(fragment)
 ```
@@ -121,7 +121,7 @@ result = generator.generate(fragment)
 
 ### 6. 意图识别代码 ✅
 
-**文件位置**: `core/llm/intention_models.py`
+**文件位置**: `core/stage2/intention_generator.py`
 
 **实现内容**:
 
@@ -173,15 +173,16 @@ class DrivingIntention(Enum):
 
 ## 三、模块导出
 
-**文件位置**: `core/llm/__init__.py`
+**意图生成相关**: `core/stage2/intention_generator.py`
 
 统一导出所有公共接口：
 ```python
-from core.llm import (
-    UnifiedLLMClient, list_providers, get_provider_config,
-    TrajectoryPromptBuilder, SYSTEM_PROMPT, build_intention_query_prompt,
-    identify_key_frames, generate_intention, parse_intention_response,
-    DrivingIntention, IntentionPhase, IntentionSequence, IntentionFrame
+from core.stage2.intention_generator import (
+    LLMIntentionGenerator,
+    identify_key_frames,
+    generate_intention,
+    parse_intention_response,
+    IntentionFrame,
 )
 ```
 
@@ -201,10 +202,11 @@ from core.llm import (
 
 | 文件路径 | 说明 |
 |----------|------|
-| `core/llm/__init__.py` | 模块导出 |
-| `core/llm/prompt_builder.py` | 提示词构造（系统、用户、轨迹） |
-| `core/llm/intention_models.py` | LLM 客户端、意图识别、响应解析 |
-| `core/llm_intention_generator.py` | 意图生成器封装 |
+| `core/stage2/intention_generator.py` | 意图生成器封装（LLMIntentionGenerator + 核心函数） |
+| `core/stage2/llm/config.py` | LLM API 配置（UnifiedLLMClient） |
+| `core/stage2/llm/prompt_builder.py` | 提示词构造（系统、用户、轨迹） |
+| `core/stage2/mutator.py` | 轨迹变异器 |
+| `core/stage2/storage.py` | 数据持久化 |
 | `core/trajectory_mutator.py` | 轨迹变异器（穷举版） |
 
 ---
@@ -212,9 +214,9 @@ from core.llm import (
 ## 六、后续工作建议
 
 1. **验证意图生成流程**：使用真实片段数据调用 `LLMIntentionGenerator.generate()` 验证完整流程
-2. **对接轨迹变异**：将意图生成结果（IntentionSequence）接入 `IntentionDrivenTrajectoryMutator`
+2. **对接轨迹变异**：将意图生成结果接入 `TrajectoryMutator`
 3. **测试不同场景**：验证 qwen/openai/gemini 三个提供商的兼容性
 
 ---
 
-*最后更新: 2026-04-15*
+*最后更新: 2026-04-18*
