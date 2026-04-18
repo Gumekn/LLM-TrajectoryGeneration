@@ -33,16 +33,6 @@ from core.stage2.storage import (
 
 
 # =============================================================================
-# 默认参数配置
-# =============================================================================
-
-DEFAULT_PROVIDER = "qwen"
-DEFAULT_MODEL = "qwen3.6-plus"
-DEFAULT_INTENTION_DIR = "data/intention"
-DEFAULT_VARIANT_DIR = "data/variants"
-
-
-# =============================================================================
 # 数据类
 # =============================================================================
 
@@ -246,9 +236,9 @@ class LLMIntentionGenerator:
 
 def run_intention_analysis(
     fragment: dict,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
-    output_dir: str = DEFAULT_INTENTION_DIR,
+    provider: str,
+    model: str,
+    output_dir: str,
     save: bool = True,
 ) -> dict:
     """
@@ -275,9 +265,9 @@ def run_intention_analysis(
 
 def run_intention_analysis_with_fallback(
     fragment: dict,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
-    output_dir: str = DEFAULT_INTENTION_DIR,
+    provider: str,
+    model: str,
+    output_dir: str,
 ) -> dict:
     """
     带降级的意图分析（LLM失败时返回空意图）
@@ -303,10 +293,8 @@ def run_intention_analysis_with_fallback(
 
 def run_mutation(
     fragment_with_intention: dict,
-    top_k: float = 10.0,
-    output_dir: str = DEFAULT_VARIANT_DIR,
-    provider: str = DEFAULT_PROVIDER,
-    model: str = DEFAULT_MODEL,
+    top_k: float,
+    output_dir: str,
     save: bool = True,
     random_seed: int = None,
 ) -> list:
@@ -317,8 +305,6 @@ def run_mutation(
         fragment_with_intention: 带意图的片段数据
         top_k: 保留危险分数前K%的分支
         output_dir: 输出目录
-        provider: LLM提供商（仅用于保存元信息）
-        model: LLM模型（仅用于保存元信息）
         save: 是否保存结果
         random_seed: 随机种子
 
@@ -329,20 +315,22 @@ def run_mutation(
     variants = mutator.mutate(fragment_with_intention, top_k=top_k)
 
     if save:
-        save_variants_to_json(variants, fragment_with_intention, output_dir, provider, model)
+        save_variants_to_json(variants, fragment_with_intention, output_dir)
 
     return variants
 
 
 def generate_trajectory_variants(
     fragment_with_intention: dict,
-    top_k: float = 10.0,
+    top_k: float,
+    output_dir: str,
     random_seed: int = None,
 ) -> list:
     """generate_trajectory_variants 的别名，保持向后兼容"""
     return run_mutation(
         fragment_with_intention,
         top_k=top_k,
+        output_dir=output_dir,
         save=False,
         random_seed=random_seed,
     )

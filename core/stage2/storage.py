@@ -13,10 +13,6 @@ import json
 from typing import Dict, Any, List
 
 
-DEFAULT_INTENTION_DIR = "data/intention"
-DEFAULT_VARIANT_DIR = "data/variants"
-
-
 # =============================================================================
 # 片段 + 意图分析 结果保存
 # =============================================================================
@@ -24,9 +20,9 @@ DEFAULT_VARIANT_DIR = "data/variants"
 def save_fragment_with_intention(
     fragment: dict,
     intention_result: Dict[str, Any],
-    output_dir: str = DEFAULT_INTENTION_DIR,
-    provider: str = "qwen",
-    model: str = "qwen3.6-plus",
+    output_dir: str,
+    provider: str,
+    model: str,
 ) -> str:
     """
     保存带意图的片段数据
@@ -88,9 +84,8 @@ def save_fragment_with_intention(
 def save_variants_to_json(
     variants: List[Dict],
     fragment: dict,
-    output_dir: str = DEFAULT_VARIANT_DIR,
-    provider: str = "qwen",
-    model: str = "qwen3.6-plus",
+    output_dir: str,
+    algorithm: str = "dfs-topk",
 ) -> str:
     """
     将轨迹变异结果持久化到 JSON 文件
@@ -99,8 +94,7 @@ def save_variants_to_json(
         variants: 变异轨迹列表
         fragment: 原始片段数据
         output_dir: 输出目录
-        provider: LLM 提供商
-        model: LLM 模型
+        algorithm: 变异算法标识
 
     Returns:
         保存的文件路径
@@ -122,7 +116,7 @@ def save_variants_to_json(
         "metadata": meta,
         "variant_count": len(variants),
         "variants": variants,
-        "generation_info": {"provider": provider, "model": model},
+        "generation_info": {"algorithm": algorithm},
     }
 
     with open(file_path, "w", encoding="utf-8") as f:
