@@ -181,7 +181,7 @@ class InteractiveBrowser:
 
 path = r"D:\PythonProjects\Python_projects_anaconda_zpb\LLM-trajctory\LLM-HYNdatasets"
 subset = "waymo-open"
-target_id = '10135f16cd538e19_Step6_TextPrompt'
+target_id = '10135f16cd538e19'
 
 manager = WaymoDataManager(path, subset)
 manager.load_scenarios([target_id])

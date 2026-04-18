@@ -1,14 +1,15 @@
 """
-core/llm_intention_generator.py - LLM 意图生成器
+core/stage2/intention_generator.py - LLM 意图生成器（第二阶段：意图分析）
 
 调用流程：
 1. build_trajectory_prompt() - 构造轨迹信息提示词
 2. generate_intention() - 调用 LLM API 生成意图
+3. generate_trajectory_variants() - 基于意图生成轨迹变异（第三阶段）
 
-提示词构建统一在 prompt_builder.py 中，方便后续优化。
+提示词构建统一在 core/stage2/llm/prompt_builder.py 中，方便后续优化。
 
 使用示例：
-    from core.llm_intention_generator import build_trajectory_prompt, generate_intention
+    from core.stage2.intention_generator import build_trajectory_prompt, generate_intention
 
     # Step 1: 构造轨迹提示词
     prompt = build_trajectory_prompt(fragment)
@@ -16,14 +17,19 @@ core/llm_intention_generator.py - LLM 意图生成器
     # Step 2: 生成意图
     generator = LLMIntentionGenerator(provider="qwen", model="qwen3.6-plus")
     intention_result = generator.generate(fragment)
+
+    # Step 3: 生成轨迹变异
+    from core.stage2.intention_generator import generate_trajectory_variants, save_variants_to_json
+    variants = generate_trajectory_variants(intention_result)
+    save_variants_to_json(variants, intention_result)
 """
 
-from core.llm.prompt_builder import (
+from core.stage2.llm.prompt_builder import (
     TrajectoryPromptBuilder,
     SYSTEM_PROMPT,
     build_intention_query_prompt,
 )
-from core.llm.intention_models import (
+from core.stage2.llm.intention_models import (
     UnifiedLLMClient,
     identify_key_frames,
     generate_intention as call_llm_generate_intention,
@@ -209,4 +215,73 @@ def save_fragment_with_intention(
         json.dump(output_data, f, indent=2, ensure_ascii=False)
 
     print(f"已保存到: {file_path}")
+    return file_path
+
+
+# =============================================================================
+# 轨迹变异便捷函数（第三阶段）
+# =============================================================================
+
+DEFAULT_VARIANT_DIR = "data/variants"
+
+
+def generate_trajectory_variants(
+    fragment_with_intention: dict,
+    top_k: float = 10.0,
+    random_seed: int = None
+) -> list:
+    """
+    基于意图分析结果生成轨迹变异（第三阶段）
+
+    支持多种输入格式：
+    - 直接传入 generate() 的返回值
+    - 带 original_fragment 嵌套的格式
+    - 带 intention_sequence 的格式
+
+    Args:
+        fragment_with_intention: 包含意图分析结果的片段数据
+        top_k: 保留危险分数前K%的分支
+        random_seed: 随机种子
+
+    Returns:
+        变异轨迹列表
+    """
+    from core.stage2.mutator import TrajectoryMutator
+    mutator = TrajectoryMutator(random_seed=random_seed)
+    return mutator.mutate(fragment_with_intention, top_k=top_k)
+
+
+def save_variants_to_json(
+    variants: list,
+    fragment: dict,
+    output_dir: str = DEFAULT_VARIANT_DIR,
+    provider: str = "qwen",
+    model: str = "qwen3.6-plus"
+) -> str:
+    """将轨迹变异结果持久化到 JSON 文件"""
+    import os
+    os.makedirs(output_dir, exist_ok=True)
+
+    frag = fragment.get("original_fragment", fragment)
+    meta = frag.get("metadata", {})
+    scenario_id = meta.get("scenario_id", "unknown")
+    ego_id = meta.get("ego_vehicle_id", "unknown")
+    target_id = frag.get("target_trajectory", {}).get("vehicle_id", "unknown")
+    fragment_id = frag.get("fragment_id", f"{scenario_id}_{ego_id}_{target_id}")
+
+    file_name = f"{fragment_id}_variants.json"
+    file_path = os.path.join(output_dir, file_name)
+
+    output_data = {
+        "fragment_id": fragment_id,
+        "metadata": meta,
+        "variant_count": len(variants),
+        "variants": variants,
+        "generation_info": {"provider": provider, "model": model},
+    }
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        json.dump(output_data, f, indent=2, ensure_ascii=False)
+
+    print(f"已保存 {len(variants)} 条变异轨迹到: {file_path}")
     return file_path

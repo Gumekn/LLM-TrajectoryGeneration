@@ -1,27 +1,28 @@
 """
-core/llm/intention_models.py - 意图生成核心模块
+core/stage2/llm/intention_models.py - LLM 意图生成核心模块
 
 职责：
 - 统一 LLM 客户端封装（支持 qwen/openai/gemini）
 - 关键帧识别
 - LLM 调用与响应解析
 
-使用示例：
-    from core.llm.intention_models import UnifiedLLMClient, identify_key_frames
+注意：轨迹变异相关功能已迁移到 core/stage2/mutator.py
 
+使用示例：
     # LLM 客户端
+    from core.stage2.llm.intention_models import UnifiedLLMClient
     client = UnifiedLLMClient(provider="qwen", model="qwen3.6-plus")
-    response = client.chat("请分析以下轨迹...")
 
     # 关键帧识别
+    from core.stage2.llm.intention_models import identify_key_frames
     key_frames = identify_key_frames(fragment)
 """
 
 import os
 import json
 import re
-from dataclasses import dataclass
 from typing import Dict, Any, Optional, List
+from dataclasses import dataclass
 
 
 # =============================================================================

@@ -1,5 +1,5 @@
 """
-core/llm/prompt_builder.py - 提示词构造器
+core/stage2/llm/prompt_builder.py - 提示词构造器
 
 包含：
 1. 用户提示词构造（build_intention_query_prompt）
@@ -9,14 +9,14 @@ core/llm/prompt_builder.py - 提示词构造器
 5. 意图数据结构（IntentionPhase, IntentionSequence）
 
 使用示例：
-    from core.llm.prompt_builder import TrajectoryPromptBuilder, SYSTEM_PROMPT
+    from core.stage2.llm.prompt_builder import TrajectoryPromptBuilder, SYSTEM_PROMPT
 
     # Step 1: 构造轨迹提示词
     builder = TrajectoryPromptBuilder(sample_interval=2)
     prompt = builder.build_prompt(fragment)
 
     # Step 2: 构造完整 LLM 提示词
-    from core.llm.prompt_builder import build_intention_query_prompt
+    from core.stage2.llm.prompt_builder import build_intention_query_prompt
     full_prompt = build_intention_query_prompt(trajectory_prompt, key_frames, SYSTEM_PROMPT)
 """
 
@@ -631,67 +631,6 @@ Target速度范围: {min_target:.2f} - {max_target:.2f} m/s (平均 {avg_target:
 # =============================================================================
 # 驾驶意图类型定义
 # =============================================================================
-
-class DrivingIntention(Enum):
-    """驾驶意图类型 - 供Python代码类型安全使用，LLM看到的是SYSTEM_PROMPT中的文本定义"""
-    CRUISE_MAINTAIN = "cruise_maintain"
-    ACCELERATE_THROUGH = "accelerate_through"
-    DECELERATE_TO_YIELD = "decelerate_to_yield"
-    DECELERATE_TO_STOP = "decelerate_to_stop"
-    EMERGENCY_BRAKE = "emergency_brake"
-    LANE_CHANGE_LEFT = "lane_change_left"
-    LANE_CHANGE_RIGHT = "lane_change_right"
-    TURN_LEFT = "turn_left"
-    TURN_RIGHT = "turn_right"
-    GO_STRAIGHT = "go_straight"
-    UNKNOWN = "unknown"
-
-
-# =============================================================================
-# 意图数据结构
-# =============================================================================
-
-@dataclass
-class IntentionPhase:
-    """意图阶段 - 一个时间段内的驾驶意图"""
-    start_frame: int
-    end_frame: int
-    intention: DrivingIntention
-    reasoning: str = ""
-
-    @property
-    def frame_count(self) -> int:
-        return self.end_frame - self.start_frame
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "start_frame": self.start_frame,
-            "end_frame": self.end_frame,
-            "intention": self.intention.value,
-            "reasoning": self.reasoning,
-        }
-
-
-@dataclass
-class IntentionSequence:
-    """意图序列 - 整个轨迹片段的意图规划"""
-    phases: List[IntentionPhase] = field(default_factory=list)
-    overall_strategy: str = ""
-    raw_response: str = ""
-    trajectory_prompt: str = ""
-
-    def get_intention_at_frame(self, frame: int) -> DrivingIntention:
-        for phase in self.phases:
-            if phase.start_frame <= frame < phase.end_frame:
-                return phase.intention
-        return DrivingIntention.UNKNOWN
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "intention_sequence": [
-                {"phase": f"phase_{i}", **p.to_dict()}
-                for i, p in enumerate(self.phases)
-            ],
-            "overall_strategy": self.overall_strategy,
-            "trajectory_prompt": self.trajectory_prompt,
-        }
+# 注意: DrivingIntention, IntentionPhase, IntentionSequence 已迁移到
+# core/llm/intention_models.py 中统一管理，此处仅保留给 LLM 的文本定义（SYSTEM_PROMPT）
+# 以避免重复定义导致的类型不一致问题
