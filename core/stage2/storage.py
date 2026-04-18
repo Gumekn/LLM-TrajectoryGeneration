@@ -5,14 +5,12 @@ core/stage2/storage.py - 数据持久化模块
 - 带意图片段的保存
 - 轨迹变异的保存
 
-数据类定义在 core/stage2/llm/intention_models.py (IntentionFrame)
+数据类定义在 core/stage2/intention_generator.py (IntentionFrame)
 """
 
 import os
 import json
 from typing import Dict, Any, List
-
-from core.stage2.llm.intention_models import IntentionFrame
 
 
 DEFAULT_INTENTION_DIR = "data/intention"
@@ -60,7 +58,7 @@ def save_fragment_with_intention(
     intention_frames_data = []
     if isinstance(intention_frames, list):
         for f in intention_frames:
-            if isinstance(f, IntentionFrame):
+            if hasattr(f, 'to_dict'):
                 intention_frames_data.append(f.to_dict())
             elif isinstance(f, dict):
                 intention_frames_data.append(f)
