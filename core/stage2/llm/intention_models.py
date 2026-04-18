@@ -2,27 +2,28 @@
 core/stage2/llm/intention_models.py - LLM 意图生成核心模块
 
 职责：
-- 统一 LLM 客户端封装（支持 qwen/openai/gemini）
+- 意图帧数据类
 - 关键帧识别
 - LLM 调用与响应解析
 
-注意：轨迹变异相关功能已迁移到 core/stage2/mutator.py
+注意：
+- LLM 客户端已迁移到 core/stage2/llm/config.py
+- 轨迹变异相关功能在 core/stage2/mutator.py
 
 使用示例：
-    # LLM 客户端
-    from core.stage2.llm.intention_models import UnifiedLLMClient
-    client = UnifiedLLMClient(provider="qwen", model="qwen3.6-plus")
+    from core.stage2.llm.intention_models import identify_key_frames, parse_intention_response
+    from core.stage2.llm.config import UnifiedLLMClient
 
     # 关键帧识别
-    from core.stage2.llm.intention_models import identify_key_frames
     key_frames = identify_key_frames(fragment)
 """
 
-import os
 import json
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, List
 from dataclasses import dataclass
+
+from core.stage2.llm.config import UnifiedLLMClient
 
 
 # =============================================================================
@@ -53,144 +54,6 @@ class IntentionFrame:
             "intention": self.intention,
             "reasoning": self.reasoning,
         }
-
-
-# =============================================================================
-# 统一 LLM 客户端
-# =============================================================================
-
-def list_providers() -> Dict[str, str]:
-    """
-    列出所有支持的 LLM 提供商
-
-    返回：
-        提供商名称 -> 支持模型描述
-    """
-    return {
-        "qwen": "阿里千问 (qwen3.6-plus, qwen-plus, qwen-max, qwen-turbo)",
-        "openai": "OpenAI GPT (gpt-4o, gpt-4o-mini, gpt-4-turbo)",
-        "gemini": "Google Gemini (gemini-2.0-flash, gemini-2.0-pro)",
-    }
-
-
-def get_provider_config(provider: str) -> Dict[str, Any]:
-    """
-    获取 LLM 提供商的配置
-
-    参数：
-        provider: 提供商名称 (qwen/openai/gemini)
-
-    返回：
-        包含 api_key_env 和 base_url 的配置字典
-
-    异常：
-        ValueError: 不支持的提供商
-    """
-    configs = {
-        "qwen": {
-            "api_key_env": "DASHSCOPE_API_KEY",
-            "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        },
-        "openai": {
-            "api_key_env": "OPENAI_API_KEY",
-            "base_url": "https://api.openai.com/v1",
-        },
-        "gemini": {
-            "api_key_env": "GEMINI_API_KEY",
-            "base_url": None,
-        },
-    }
-    if provider not in configs:
-        raise ValueError(f"不支持的提供商: {provider}，支持的: {list(configs.keys())}")
-    return configs[provider]
-
-
-class UnifiedLLMClient:
-    """
-    统一 LLM 客户端 - 封装不同提供商的 API 调用
-
-    初始化：
-        from core.llm.intention_models import UnifiedLLMClient
-        client = UnifiedLLMClient(provider="qwen", model="qwen3.6-plus")
-
-    调用：
-        response = client.chat("你的问题")
-    """
-
-    def __init__(self, provider: str, model: str, api_key: Optional[str] = None):
-        """
-        初始化 LLM 客户端
-
-        参数：
-            provider: 提供商名称 (qwen/openai/gemini)
-            model: 模型名称
-            api_key: 可选，手动指定 API key（默认从环境变量读取）
-        """
-        config = get_provider_config(provider)
-        self.provider = provider
-        self.model = model
-
-        self.api_key = api_key or os.environ.get(config["api_key_env"])
-        if not self.api_key:
-            raise ValueError(f"请设置环境变量 {config['api_key_env']}")
-
-        self.base_url = config["base_url"]
-        self._init_client()
-
-    def _init_client(self):
-        """根据提供商初始化底层客户端"""
-        if self.provider in ("qwen", "openai"):
-            try:
-                from openai import OpenAI
-            except ImportError:
-                raise ImportError("请安装 openai 包: pip install openai")
-            self._client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-
-        elif self.provider == "gemini":
-            try:
-                from google import genai
-            except ImportError:
-                raise ImportError("请安装 google-genai 包: pip install google-genai")
-            self._client = genai.Client(api_key=self.api_key)
-
-    @property
-    def name(self) -> str:
-        """返回 'provider-model' 格式的名称"""
-        return f"{self.provider}-{self.model}"
-
-    def chat(self, prompt: str, **kwargs) -> str:
-        """
-        发送对话请求
-
-        参数：
-            prompt: 用户提示词
-            temperature: 温度参数（默认0.7）
-            max_tokens: 最大token数（默认4096）
-
-        返回：
-            LLM 响应的文本内容
-        """
-        temperature = kwargs.get("temperature", 0.7)
-        max_tokens = kwargs.get("max_tokens", 4096)
-
-        if self.provider in ("qwen", "openai"):
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature,
-                max_tokens=max_tokens
-            )
-            return response.choices[0].message.content
-
-        elif self.provider == "gemini":
-            response = self._client.models.generate_content(
-                model=self.model,
-                contents=[{"role": "user", "parts": [{"text": prompt}]}],
-                config={"temperature": temperature}
-            )
-            return response.text
-
-        raise NotImplementedError(f"未实现的提供商: {self.provider}")
 
 
 # =============================================================================
@@ -418,3 +281,86 @@ def parse_intention_response(
         "intention_frames": result_frames,
         "trajectory_prompt": trajectory_prompt
     }
+
+
+# =============================================================================
+# LLM 意图生成器
+# =============================================================================
+
+from core.stage2.llm.prompt_builder import (
+    TrajectoryPromptBuilder,
+    SYSTEM_PROMPT,
+    build_intention_query_prompt,
+)
+
+
+class LLMIntentionGenerator:
+    """
+    基于 LLM 的意图生成器
+
+    使用示例：
+        generator = LLMIntentionGenerator(provider="qwen", model="qwen3.6-plus")
+        intention_result = generator.generate(fragment)
+    """
+
+    def __init__(self, provider: str = "qwen", model: str = "qwen3.6-plus", api_key: str = None):
+        self.client = UnifiedLLMClient(provider=provider, model=model, api_key=api_key)
+        self.provider = provider
+        self.model = model
+        self.prompt_builder = TrajectoryPromptBuilder()
+
+    def build_trajectory_prompt(self, fragment: dict) -> str:
+        """Step 1: 构造轨迹信息提示词"""
+        return self.prompt_builder.build_prompt(fragment)
+
+    def generate(self, fragment: dict) -> Dict[str, Any]:
+        """
+        完整流程：Step 1 + Step 2
+
+        Args:
+            fragment: 轨迹片段数据
+
+        Returns:
+            意图分析结果，包含 intention_frames 列表和 trajectory_prompt
+        """
+        # Step 1: 轨迹提示词
+        trajectory_prompt = self.build_trajectory_prompt(fragment)
+
+        # Step 2: 计算关键帧
+        key_frames = identify_key_frames(fragment)
+
+        # Step 3: 构造完整询问提示词
+        full_prompt = build_intention_query_prompt(
+            trajectory_prompt, key_frames, SYSTEM_PROMPT
+        )
+
+        # Step 4: 调用 LLM
+        response = generate_intention(
+            self.client, full_prompt, self.model
+        )
+
+        # Step 5: 解析响应
+        result = parse_intention_response(response, key_frames, trajectory_prompt)
+
+        return result
+
+    def generate_with_fallback(self, fragment: dict) -> Dict[str, Any]:
+        """
+        带默认值的意图生成（LLM 失败时返回空列表）
+
+        Args:
+            fragment: 轨迹片段数据
+
+        Returns:
+            意图分析结果
+        """
+        try:
+            return self.generate(fragment)
+        except Exception as e:
+            print(f"意图生成失败: {e}")
+            trajectory_prompt = self.build_trajectory_prompt(fragment)
+            return {
+                "intention_frames": [],
+                "trajectory_prompt": trajectory_prompt,
+                "error": str(e)
+            }

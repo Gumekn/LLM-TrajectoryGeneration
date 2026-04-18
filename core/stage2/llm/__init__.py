@@ -7,11 +7,10 @@ core/stage2/llm - LLM 模块
 - gemini (Google Gemini)
 
 包含：
-- UnifiedLLMClient - 统一 LLM 客户端
-- TrajectoryPromptBuilder - 轨迹信息提示词构造器
-- SYSTEM_PROMPT - LLM 系统提示词
-- IntentionFrame - 意图帧数据类型
-- identify_key_frames, generate_intention, parse_intention_response - 意图生成函数
+- config - LLM API 配置（UnifiedLLMClient、提供商配置）
+- prompt_builder - 轨迹信息提示词构造器
+- intention_models - 意图帧数据类型与解析
+- mutator - 轨迹变异穷举算法
 
 使用示例：
     from core.stage2.llm import UnifiedLLMClient, TrajectoryPromptBuilder, SYSTEM_PROMPT
@@ -29,10 +28,15 @@ core/stage2/llm - LLM 模块
     key_frames = identify_key_frames(fragment)
 """
 
-from core.stage2.llm.intention_models import (
+# LLM 客户端配置
+from core.stage2.llm.config import (
     UnifiedLLMClient,
     list_providers,
     get_provider_config,
+)
+
+# 意图生成
+from core.stage2.llm.intention_models import (
     identify_key_frames,
     generate_intention,
     parse_intention_response,
@@ -40,12 +44,14 @@ from core.stage2.llm.intention_models import (
     IntentionFrame,
 )
 
+# 提示词构造
 from core.stage2.llm.prompt_builder import (
     TrajectoryPromptBuilder,
     SYSTEM_PROMPT,
     build_intention_query_prompt,
 )
 
+# 轨迹变异（从 mutator 导入）
 from core.stage2.mutator import (
     TrajectoryMutator,
     merge_intentions,
@@ -63,12 +69,12 @@ from core.stage2.mutator import (
 )
 
 __all__ = [
-    # 统一客户端
+    # 统一客户端（config.py）
     "UnifiedLLMClient",
     "list_providers",
     "get_provider_config",
 
-    # 意图生成函数
+    # 意图生成函数（intention_models.py）
     "identify_key_frames",
     "build_intention_query_prompt",
     "generate_intention",
@@ -76,11 +82,11 @@ __all__ = [
     "extract_json_from_response",
     "IntentionFrame",
 
-    # 提示词构造
+    # 提示词构造（prompt_builder.py）
     "TrajectoryPromptBuilder",
     "SYSTEM_PROMPT",
 
-    # 轨迹变异
+    # 轨迹变异（mutator.py）
     "TrajectoryMutator",
     "merge_intentions",
     "dfs_mutate_with_pruning",
