@@ -16,15 +16,19 @@ main.py - 危险轨迹生成系统 第一阶段主程序
     python main.py
 """
 
-import os
 import sys
+import os
+
+# 确保项目根目录在 sys.path 中（支持直接双击运行，必须在最前面）
+# __file__ = core/stage1/main.py, dirname x3 = 项目根目录
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
 import argparse
 from typing import List, Dict, Optional
 
-# 让 `from core import ...` 能正确解析
-#sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from core.stage1 import (
+from core.stage1.processor import (
     WaymoDataLoader,
     ScenarioRiskAnalyzer,
     ScenarioProcessor,
@@ -40,9 +44,9 @@ DATA_DIR = "data/waymo-open"          # Waymo原始数据目录
 OUTPUT_DIR = "data/processed"         # 处理后数据输出目录
 
 # 截取参数
-N_BEFORE_SEC = 2.0                   # 锚点前截取时长（秒）
-N_AFTER_SEC = 3.0                    # 锚点后截取时长（秒）
-MIN_BEFORE_FRAMES = 10               # 锚点前最小帧数阈值（帧），低于此值则跳过
+N_BEFORE_SEC = 6.0                   # 锚点前截取时长（秒）
+N_AFTER_SEC = 4.0                    # 锚点后截取时长（秒）
+MIN_BEFORE_FRAMES = 20               # 锚点前最小帧数阈值（帧），低于此值则跳过
 MIN_AFTER_FRAMES = 15                # 锚点后最小帧数阈值（帧），低于此值则跳过
 
 # 风险分析参数
