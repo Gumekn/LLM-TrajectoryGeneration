@@ -473,7 +473,7 @@ def dfs_mutate_with_pruning(
 # 轨迹变异器
 # =============================================================================
 
-def build_variant_output(variant_states: List[TrajectoryState], ego_trajectory: Dict, variant_id: int) -> Dict:
+def build_variant_output(variant_states: List[TrajectoryState], variant_id: int) -> Dict:
     """将变异状态序列构建为输出格式"""
     positions = [[s.x, s.y, 0.0] for s in variant_states]
     headings = [s.theta for s in variant_states]
@@ -482,11 +482,13 @@ def build_variant_output(variant_states: List[TrajectoryState], ego_trajectory: 
 
     return {
         "variant_id": variant_id,
-        "positions": positions,
-        "headings": headings,
-        "velocities": velocities,
-        "accelerations": accelerations,
-        "valid": [True] * len(variant_states)
+        "mutated_target_trajectory": {
+            "positions": positions,
+            "headings": headings,
+            "velocities": velocities,
+            "accelerations": accelerations,
+            "valid": [True] * len(variant_states)
+        }
     }
 
 
@@ -559,7 +561,7 @@ class TrajectoryMutator:
         dfs_mutate_with_pruning(0, blocks, initial_state, [], results, ego_trajectory, top_k)
 
         return [
-            build_variant_output(traj, ego_trajectory, i)
+            build_variant_output(traj, i)
             for i, (traj, risk) in enumerate(results)
         ]
 

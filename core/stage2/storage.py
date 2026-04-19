@@ -111,9 +111,14 @@ def save_variants_to_json(
     file_name = f"{fragment_id}_variants.json"
     file_path = os.path.join(output_dir, file_name)
 
+    ego_trajectory = frag.get("ego_trajectory", {})
+    original_target_trajectory = frag.get("target_trajectory", {})
+
     output_data = {
         "fragment_id": fragment_id,
         "metadata": meta,
+        "ego_trajectory": ego_trajectory,
+        "original_target_trajectory": original_target_trajectory,
         "variant_count": len(variants),
         "variants": variants,
         "generation_info": {"algorithm": algorithm},

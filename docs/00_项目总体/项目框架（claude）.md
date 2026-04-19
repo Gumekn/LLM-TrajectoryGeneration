@@ -1652,6 +1652,8 @@ tests/
 | 数据持久化 | core/stage2/storage.py | ✓ 已实现 | 带意图片段和变异结果保存 |
 | 入口脚本 | core/stage2/run_intention.py | ✓ 已实现 | 意图生成入口 |
 | 入口脚本 | core/stage2/run_mutation.py | ✓ 已实现 | 轨迹变异入口 |
+| 可视化核心 | core/stage2/variant_visualizer.py | ✓ 已实现 | 轨迹可视化核心函数 |
+| 可视化入口 | core/stage2/visualize_runner.py | ✓ 已实现 | 可视化入口脚本 |
 
 ### 当前目录结构
 
@@ -1670,6 +1672,8 @@ TrajectoryAnalysis/
 │       ├── storage.py              # 数据持久化
 │       ├── run_intention.py        # 意图生成入口脚本
 │       ├── run_mutation.py         # 轨迹变异入口脚本
+│       ├── variant_visualizer.py  # 可视化核心模块
+│       └── visualize_runner.py     # 可视化入口脚本
 │       └── llm/                    # LLM 相关模块
 │           ├── __init__.py
 │           ├── config.py          # LLM API 配置
@@ -1754,8 +1758,8 @@ class ScenarioRiskAnalyzer:
 
 ---
 
-*文档版本: v2.5*
+*文档版本: v2.6*
 *技术方案: 穷举生成 + LLM剪枝*
-*最后更新: 2026-04-18*
+*最后更新: 2026-04-19*
 *Stage 1完成状态: ✓ 已完成*
-*Stage 2完成状态: ✓ 意图生成 + 轨迹变异已完成，入口脚本已就绪*
+*Stage 2完成状态: ✓ 意图生成 + 轨迹变异已完成，可视化模块已实现*

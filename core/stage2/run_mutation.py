@@ -28,7 +28,7 @@ def main():
     # =============================================================
     INTENTION_INPUT_DIR = "data/intention"   # run_intention 输出目录
     VARIANT_OUTPUT_DIR = "data/variants"
-    TOP_K = 100.0
+    TOP_K = 30.0
     RANDOM_SEED = None
     # =============================================================
 
